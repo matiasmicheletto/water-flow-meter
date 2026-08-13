@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Flow Meter</title>
+</head>
+<body>
+  <h4 id="flow">Flow: -- L/min</h4>
+
+  <script>
+    async function poll() {
+      try {
+        const res = await fetch('/api/current');
+        const data = await res.json();
+        document.getElementById('flow').textContent =
+          `Flow: ${data.flow_lpm.toFixed(2)} L/min (total: ${data.liters_acc.toFixed(2)} L)`;
+      } catch (e) {
+        document.getElementById('flow').textContent = 'Flow: connection lost';
+      }
+    }
+    setInterval(poll, 1000);
+    poll();
+  </script>
+</body>
+</html>

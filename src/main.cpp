@@ -1,8 +1,8 @@
 /*
  * Water flow meter - ESP32-CAM + YF-S401
- * Step 1: sensor sampling (1s) + buffered SD logging (flush ~60s)
+ * Step 1: sensor pulse sampling (1s) + buffered SD logging (flush ~60s)
  *         + AP mode + web server serving LittleFS index.html
- *         + /api/current JSON endpoint (polled by the page)
+ *         + JSON endpoints for current reading, history, and CSV export
  *
  * Camera is NOT initialized -> its pins are free for SD_MMC + sensor.
  */
@@ -20,16 +20,11 @@
 // SD_MMC 1-bit mode uses fixed pins on ESP32-CAM: CLK=14, CMD=15, D0=2
 // (D1/D2/D3 normally used by camera - we skip them by using 1-bit mode)
 
-// ---------- Flow sensor calibration --------------------------------------
-// YF-S401: verify this constant against your specific unit's datasheet.
-// Commonly cited around 5880 pulses/L for the small-bore YF-S401 (~98 Hz per L/min).
-// CHANGE THIS to match your sensor's actual calibration sheet.
-static const float PULSES_PER_LITER = 5880.0f;
-
 // ---------- Timing ---------------------------------------------------------
 static const uint32_t SAMPLE_INTERVAL_MS = 1000;   // measure every 1s
 static const uint32_t FLUSH_INTERVAL_MS  = 60000;  // dump to SD every ~60s
 static const size_t   BUFFER_CAPACITY    = 70;      // ~70s of margin before flush
+static const size_t   HISTORY_LIMIT      = 120;     // recent points served to the dashboard
 
 // ---------- AP credentials ---------------------------------------------
 static const char* AP_SSID = "FlowMeter";
@@ -44,17 +39,18 @@ void IRAM_ATTR onPulse() {
 
 // ---------- Record buffer ---------------------------------------------
 struct FlowRecord {
-  uint32_t t_ms;       // millis() at time of sample (relative timestamp)
-  float    flow_lpm;   // instantaneous flow, liters/minute
-  float    liters_acc; // cumulative liters since boot
+  uint32_t t_ms;              // millis() at time of sample (relative timestamp)
+  uint32_t pulses_sample;     // pulses counted during this sample window
+  uint32_t pulses_total_acc;  // cumulative pulses since boot
 };
 
 FlowRecord buffer[BUFFER_CAPACITY];
 size_t bufferLen = 0;
 
-float totalLiters = 0.0f;
-float currentFlowLpm = 0.0f;   // latest reading, exposed via /api/current
+uint32_t totalPulses = 0;
+uint32_t currentPulseCount = 0;   // latest reading, exposed via /api/current
 uint32_t currentSampleTime = 0;
+uint32_t measurementStartMs = 0;
 
 uint32_t lastSampleMs = 0;
 uint32_t lastFlushMs = 0;
@@ -64,12 +60,37 @@ const char* LOG_PATH = "/flow_log.csv";
 
 AsyncWebServer server(80);
 
+void appendHistoryRecord(FlowRecord *records, size_t &count, const FlowRecord &record) {
+  if (count < HISTORY_LIMIT) {
+    records[count++] = record;
+    return;
+  }
+
+  memmove(records, records + 1, sizeof(FlowRecord) * (HISTORY_LIMIT - 1));
+  records[HISTORY_LIMIT - 1] = record;
+}
+
+bool parseFlowRecordLine(const String &line, FlowRecord &record) {
+  unsigned long tMs = 0;
+  unsigned long pulsesSample = 0;
+  unsigned long pulsesTotalAcc = 0;
+
+  if (sscanf(line.c_str(), "%lu,%lu,%lu", &tMs, &pulsesSample, &pulsesTotalAcc) != 3) {
+    return false;
+  }
+
+  record.t_ms = static_cast<uint32_t>(tMs);
+  record.pulses_sample = static_cast<uint32_t>(pulsesSample);
+  record.pulses_total_acc = static_cast<uint32_t>(pulsesTotalAcc);
+  return true;
+}
+
 // ---------- SD helpers ---------------------------------------------------
 void ensureLogHeader() {
   if (!SD_MMC.exists(LOG_PATH)) {
     File f = SD_MMC.open(LOG_PATH, FILE_WRITE);
     if (f) {
-      f.println("t_ms,flow_lpm,liters_acc");
+      f.println("t_ms,pulses_sample,pulses_total_acc");
       f.close();
     }
   }
@@ -85,8 +106,8 @@ void flushBufferToSD() {
     return;
   }
   for (size_t i = 0; i < bufferLen; i++) {
-    f.printf("%lu,%.3f,%.3f\n",
-             buffer[i].t_ms, buffer[i].flow_lpm, buffer[i].liters_acc);
+    f.printf("%lu,%lu,%lu\n",
+             buffer[i].t_ms, buffer[i].pulses_sample, buffer[i].pulses_total_acc);
   }
   f.close();
   Serial.printf("[SD] flushed %u records\n", (unsigned)bufferLen);
@@ -101,25 +122,26 @@ void sampleFlow() {
   pulseCount = 0;
   interrupts();
 
-  // pulses in this 1s window -> instantaneous flow rate (L/min)
-  float litersThisSample = pulses / PULSES_PER_LITER;
-  float flow_lpm = litersThisSample * 60.0f; // 1s window -> scale to per-minute
+  uint32_t sampleTimestampMs = millis();
+  if (measurementStartMs == 0) {
+    measurementStartMs = sampleTimestampMs;
+  }
 
-  totalLiters += litersThisSample;
-  currentFlowLpm = flow_lpm;
-  currentSampleTime = millis();
+  totalPulses += pulses;
+  currentPulseCount = pulses;
+  currentSampleTime = sampleTimestampMs - measurementStartMs;
 
   if (bufferLen < BUFFER_CAPACITY) {
     buffer[bufferLen].t_ms = currentSampleTime;
-    buffer[bufferLen].flow_lpm = flow_lpm;
-    buffer[bufferLen].liters_acc = totalLiters;
+    buffer[bufferLen].pulses_sample = pulses;
+    buffer[bufferLen].pulses_total_acc = totalPulses;
     bufferLen++;
   } else {
     // buffer full before scheduled flush - flush now to avoid losing data
     flushBufferToSD();
     buffer[bufferLen].t_ms = currentSampleTime;
-    buffer[bufferLen].flow_lpm = flow_lpm;
-    buffer[bufferLen].liters_acc = totalLiters;
+    buffer[bufferLen].pulses_sample = pulses;
+    buffer[bufferLen].pulses_total_acc = totalPulses;
     bufferLen++;
   }
 }
@@ -146,14 +168,87 @@ void setupServer() {
   server.on("/api/current", HTTP_GET, [](AsyncWebServerRequest *request) {
     JsonDocument doc;
     doc["t_ms"] = currentSampleTime;
-    doc["flow_lpm"] = currentFlowLpm;
-    doc["liters_acc"] = totalLiters;
+    doc["pulses_sample"] = currentPulseCount;
+    doc["pulses_total_acc"] = totalPulses;
     doc["buffered"] = bufferLen;
     doc["sd_ready"] = sdReady;
 
     String out;
     serializeJson(doc, out);
     request->send(200, "application/json", out);
+  });
+
+  server.on("/api/history", HTTP_GET, [](AsyncWebServerRequest *request) {
+    FlowRecord history[HISTORY_LIMIT];
+    size_t historyCount = 0;
+
+    if (sdReady && SD_MMC.exists(LOG_PATH)) {
+      File f = SD_MMC.open(LOG_PATH, FILE_READ);
+      if (f) {
+        while (f.available()) {
+          String line = f.readStringUntil('\n');
+          line.trim();
+          if (line.isEmpty() || line.startsWith("t_ms,")) {
+            continue;
+          }
+
+          FlowRecord record;
+          if (parseFlowRecordLine(line, record)) {
+            appendHistoryRecord(history, historyCount, record);
+          }
+        }
+        f.close();
+      }
+    }
+
+    for (size_t i = 0; i < bufferLen; i++) {
+      appendHistoryRecord(history, historyCount, buffer[i]);
+    }
+
+    JsonDocument doc;
+    JsonArray points = doc["points"].to<JsonArray>();
+    for (size_t i = 0; i < historyCount; i++) {
+      JsonObject point = points.add<JsonObject>();
+      point["t_ms"] = history[i].t_ms;
+      point["pulses_sample"] = history[i].pulses_sample;
+      point["pulses_total_acc"] = history[i].pulses_total_acc;
+    }
+    doc["sample_interval_ms"] = SAMPLE_INTERVAL_MS;
+    doc["measurement_started"] = measurementStartMs != 0;
+
+    String out;
+    serializeJson(doc, out);
+    request->send(200, "application/json", out);
+  });
+
+  server.on("/api/export.csv", HTTP_GET, [](AsyncWebServerRequest *request) {
+    AsyncResponseStream *response = request->beginResponseStream("text/csv");
+    response->addHeader("Content-Disposition", "attachment; filename=flow-history.csv");
+    response->print("t_ms,pulses_sample,pulses_total_acc\n");
+
+    if (sdReady && SD_MMC.exists(LOG_PATH)) {
+      File f = SD_MMC.open(LOG_PATH, FILE_READ);
+      if (f) {
+        while (f.available()) {
+          String line = f.readStringUntil('\n');
+          line.trim();
+          if (line.isEmpty() || line.startsWith("t_ms,")) {
+            continue;
+          }
+          response->println(line);
+        }
+        f.close();
+      }
+    }
+
+    for (size_t i = 0; i < bufferLen; i++) {
+      response->printf("%lu,%lu,%lu\n",
+                       buffer[i].t_ms,
+                       buffer[i].pulses_sample,
+                       buffer[i].pulses_total_acc);
+    }
+
+    request->send(response);
   });
 
   server.begin();
@@ -171,7 +266,7 @@ void setup() {
   IPAddress local_IP(10, 0, 0, 1);     // Target IP address
   IPAddress gateway(10, 0, 0, 1);      // Gateway (typically matches IP for AP)
   IPAddress subnet(255, 255, 255, 0);  // Subnet mask
-  WiFi.softAPConfig(local_IP, gateway, subnet);
+  WiFi.softAPConfig(local_IP, gateway, subnet); // URL is http://10.0.0.1:8080
   WiFi.softAP(AP_SSID, AP_PASS);
 
   setupServer();

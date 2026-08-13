@@ -2,22 +2,465 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Flow Meter</title>
+<style>
+  :root {
+    --bg: #f6f1e8;
+    --panel: rgba(255, 252, 247, 0.9);
+    --ink: #17211f;
+    --muted: #5c6b67;
+    --accent: #0f8b6d;
+    --accent-soft: rgba(15, 139, 109, 0.14);
+    --line: #d8d0c4;
+    --shadow: 0 18px 45px rgba(23, 33, 31, 0.12);
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+    color: var(--ink);
+    background:
+      radial-gradient(circle at top left, rgba(15, 139, 109, 0.16), transparent 28%),
+      radial-gradient(circle at bottom right, rgba(198, 124, 78, 0.18), transparent 22%),
+      linear-gradient(180deg, #fcf8f2 0%, var(--bg) 100%);
+  }
+
+  .shell {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 20px 16px 28px;
+  }
+
+  .hero {
+    padding: 22px;
+    border-radius: 24px;
+    background: linear-gradient(160deg, rgba(255, 255, 255, 0.96), rgba(249, 241, 226, 0.84));
+    box-shadow: var(--shadow);
+    border: 1px solid rgba(255, 255, 255, 0.7);
+  }
+
+  .eyebrow {
+    margin: 0 0 8px;
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .reading {
+    display: flex;
+    align-items: flex-end;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .reading-value {
+    margin: 0;
+    font-size: clamp(2.4rem, 12vw, 4.6rem);
+    line-height: 0.95;
+    letter-spacing: -0.05em;
+  }
+
+  .reading-unit {
+    padding-bottom: 8px;
+    font-size: 0.95rem;
+    color: var(--muted);
+  }
+
+  .hero-meta {
+    margin-top: 16px;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+  }
+
+  .metric {
+    padding: 14px;
+    border-radius: 18px;
+    background: var(--panel);
+    border: 1px solid rgba(23, 33, 31, 0.06);
+  }
+
+  .metric-label {
+    margin: 0 0 6px;
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+  }
+
+  .metric-value {
+    margin: 0;
+    font-size: 1.2rem;
+    font-weight: 700;
+  }
+
+  .panel {
+    margin-top: 18px;
+    padding: 18px;
+    border-radius: 24px;
+    background: var(--panel);
+    box-shadow: var(--shadow);
+    border: 1px solid rgba(255, 255, 255, 0.7);
+    backdrop-filter: blur(8px);
+  }
+
+  .panel-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 14px;
+  }
+
+  .panel-title {
+    margin: 0;
+    font-size: 1rem;
+  }
+
+  .panel-copy {
+    margin: 4px 0 0;
+    font-size: 0.88rem;
+    color: var(--muted);
+  }
+
+  .status-pill {
+    padding: 8px 10px;
+    border-radius: 999px;
+    font-size: 0.8rem;
+    background: var(--accent-soft);
+    color: var(--accent);
+    white-space: nowrap;
+  }
+
+  .chart-wrap {
+    position: relative;
+    margin-top: 8px;
+    width: 100%;
+    aspect-ratio: 16 / 10;
+    min-height: 240px;
+    border-radius: 18px;
+    overflow: hidden;
+    background: linear-gradient(180deg, rgba(255,255,255,0.84), rgba(246,241,232,0.94));
+    border: 1px solid rgba(23, 33, 31, 0.07);
+  }
+
+  canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+
+  .chart-empty {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 0.95rem;
+  }
+
+  .actions {
+    display: grid;
+    gap: 12px;
+    margin-top: 18px;
+  }
+
+  .export-button {
+    appearance: none;
+    border: 0;
+    border-radius: 16px;
+    padding: 16px 18px;
+    font: inherit;
+    font-weight: 700;
+    color: #f6fff9;
+    background: linear-gradient(135deg, #0f8b6d, #0f6d62);
+    box-shadow: 0 12px 24px rgba(15, 139, 109, 0.24);
+  }
+
+  .export-note {
+    margin: 0;
+    font-size: 0.88rem;
+    color: var(--muted);
+  }
+
+  @media (min-width: 700px) {
+    .shell {
+      padding: 28px 24px 36px;
+    }
+
+    .hero,
+    .panel {
+      padding: 24px;
+    }
+
+    .actions {
+      grid-template-columns: auto 1fr;
+      align-items: center;
+    }
+  }
+</style>
 </head>
 <body>
-  <h4 id="flow">Flow: -- L/min</h4>
+  <main class="shell">
+    <section class="hero">
+      <p class="eyebrow">Water Flow Dashboard</p>
+      <div class="reading">
+        <h1 class="reading-value" id="flow-value">--</h1>
+        <span class="reading-unit">pulses / sample</span>
+      </div>
+      <div class="hero-meta">
+        <article class="metric">
+          <p class="metric-label">Elapsed time</p>
+          <p class="metric-value" id="elapsed">--:--</p>
+        </article>
+        <article class="metric">
+          <p class="metric-label">Total pulses</p>
+          <p class="metric-value" id="total-pulses">--</p>
+        </article>
+        <article class="metric">
+          <p class="metric-label">Buffered samples</p>
+          <p class="metric-value" id="buffered">--</p>
+        </article>
+        <article class="metric">
+          <p class="metric-label">Storage</p>
+          <p class="metric-value" id="storage">--</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <h2 class="panel-title">Historical pulses</h2>
+          <p class="panel-copy">Relative timestamp from measurement start, sampled every second.</p>
+        </div>
+        <span class="status-pill" id="chart-status">Waiting for samples</span>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="history-chart"></canvas>
+        <div class="chart-empty" id="chart-empty">Collecting pulse history for the chart.</div>
+      </div>
+    </section>
+
+    <section class="panel actions">
+      <button class="export-button" id="export-button" type="button">Export data to phone</button>
+      <p class="export-note" id="export-note">Creates a CSV with relative timestamps and pulse counts.</p>
+    </section>
+  </main>
 
   <script>
+    const flowValue = document.getElementById('flow-value');
+    const elapsed = document.getElementById('elapsed');
+    const totalPulses = document.getElementById('total-pulses');
+    const buffered = document.getElementById('buffered');
+    const storage = document.getElementById('storage');
+    const chartStatus = document.getElementById('chart-status');
+    const chartEmpty = document.getElementById('chart-empty');
+    const exportButton = document.getElementById('export-button');
+    const exportNote = document.getElementById('export-note');
+    const canvas = document.getElementById('history-chart');
+    const context = canvas.getContext('2d');
+    let lastHistoryPoints = [];
+
+    function formatElapsed(ms) {
+      const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+      const hours = Math.floor(totalSeconds / 3600);
+      const minutes = Math.floor((totalSeconds % 3600) / 60);
+      const seconds = totalSeconds % 60;
+
+      if (hours > 0) {
+        return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+      }
+      return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+    }
+
+    function resizeCanvas() {
+      const ratio = window.devicePixelRatio || 1;
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      canvas.width = Math.floor(width * ratio);
+      canvas.height = Math.floor(height * ratio);
+      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    }
+
+    function drawChart(points) {
+      lastHistoryPoints = points;
+      resizeCanvas();
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      context.clearRect(0, 0, width, height);
+
+      if (!points.length) {
+        chartEmpty.hidden = false;
+        chartEmpty.textContent = 'Collecting pulse history for the chart.';
+        chartStatus.textContent = 'Waiting for samples';
+        return;
+      }
+
+      chartEmpty.hidden = true;
+      chartStatus.textContent = `${points.length} points`;
+
+      const padding = { top: 18, right: 14, bottom: 32, left: 40 };
+      const innerWidth = width - padding.left - padding.right;
+      const innerHeight = height - padding.top - padding.bottom;
+      const maxPulse = Math.max(...points.map((point) => point.pulses_sample), 1);
+      const minTime = points[0].t_ms;
+      const maxTime = points[points.length - 1].t_ms || minTime + 1;
+      const timeRange = Math.max(1, maxTime - minTime);
+
+      context.strokeStyle = 'rgba(23, 33, 31, 0.12)';
+      context.lineWidth = 1;
+      context.beginPath();
+      for (let index = 0; index < 4; index += 1) {
+        const y = padding.top + (innerHeight / 3) * index;
+        context.moveTo(padding.left, y);
+        context.lineTo(width - padding.right, y);
+      }
+      context.stroke();
+
+      context.fillStyle = '#5c6b67';
+      context.font = '12px IBM Plex Sans, sans-serif';
+      context.textAlign = 'right';
+      context.fillText('0', padding.left - 8, padding.top + innerHeight + 4);
+      context.fillText(String(maxPulse), padding.left - 8, padding.top + 4);
+
+      context.textAlign = 'left';
+      context.fillText(formatElapsed(minTime), padding.left, height - 8);
+      context.textAlign = 'right';
+      context.fillText(formatElapsed(maxTime), width - padding.right, height - 8);
+
+      const gradient = context.createLinearGradient(0, padding.top, 0, height - padding.bottom);
+      gradient.addColorStop(0, 'rgba(15, 139, 109, 0.30)');
+      gradient.addColorStop(1, 'rgba(15, 139, 109, 0.02)');
+
+      context.beginPath();
+      points.forEach((point, index) => {
+        const x = padding.left + ((point.t_ms - minTime) / timeRange) * innerWidth;
+        const y = padding.top + innerHeight - (point.pulses_sample / maxPulse) * innerHeight;
+        if (index === 0) {
+          context.moveTo(x, y);
+        } else {
+          context.lineTo(x, y);
+        }
+      });
+      const lastX = padding.left + ((points[points.length - 1].t_ms - minTime) / timeRange) * innerWidth;
+      context.lineTo(lastX, padding.top + innerHeight);
+      context.lineTo(padding.left, padding.top + innerHeight);
+      context.closePath();
+      context.fillStyle = gradient;
+      context.fill();
+
+      context.beginPath();
+      points.forEach((point, index) => {
+        const x = padding.left + ((point.t_ms - minTime) / timeRange) * innerWidth;
+        const y = padding.top + innerHeight - (point.pulses_sample / maxPulse) * innerHeight;
+        if (index === 0) {
+          context.moveTo(x, y);
+        } else {
+          context.lineTo(x, y);
+        }
+      });
+      context.strokeStyle = '#0f8b6d';
+      context.lineWidth = 3;
+      context.lineJoin = 'round';
+      context.lineCap = 'round';
+      context.stroke();
+    }
+
+    async function loadCurrent() {
+      const res = await fetch('/api/current');
+      if (!res.ok) {
+        throw new Error('current request failed');
+      }
+      return res.json();
+    }
+
+    async function loadHistory() {
+      const res = await fetch('/api/history');
+      if (!res.ok) {
+        throw new Error('history request failed');
+      }
+      return res.json();
+    }
+
     async function poll() {
       try {
-        const res = await fetch('/api/current');
-        const data = await res.json();
-        document.getElementById('flow').textContent =
-          `Flow: ${data.flow_lpm.toFixed(2)} L/min (total: ${data.liters_acc.toFixed(2)} L)`;
+        const [current, history] = await Promise.all([loadCurrent(), loadHistory()]);
+        flowValue.textContent = current.pulses_sample;
+        elapsed.textContent = formatElapsed(current.t_ms);
+        totalPulses.textContent = current.pulses_total_acc;
+        buffered.textContent = current.buffered;
+        storage.textContent = current.sd_ready ? 'SD ready' : 'RAM only';
+        drawChart(history.points || []);
       } catch (e) {
-        document.getElementById('flow').textContent = 'Flow: connection lost';
+        flowValue.textContent = '--';
+        elapsed.textContent = '--:--';
+        totalPulses.textContent = '--';
+        buffered.textContent = '--';
+        storage.textContent = 'Offline';
+        chartStatus.textContent = 'Connection lost';
+        chartEmpty.hidden = false;
+        chartEmpty.textContent = 'Connection lost. Reconnect to reload live measurements.';
       }
     }
+
+    async function exportData() {
+      exportButton.disabled = true;
+      exportButton.textContent = 'Preparing export...';
+      exportNote.textContent = 'Collecting the CSV from the device.';
+
+      try {
+        const response = await fetch('/api/export.csv');
+        if (!response.ok) {
+          throw new Error('export failed');
+        }
+
+        const blob = await response.blob();
+        const fileName = `flow-history-${Date.now()}.csv`;
+
+        if (navigator.canShare && navigator.share) {
+          const file = new File([blob], fileName, { type: 'text/csv' });
+          if (navigator.canShare({ files: [file] })) {
+            await navigator.share({
+              files: [file],
+              title: 'Flow history export',
+              text: 'Pulse history from the flow meter'
+            });
+            exportNote.textContent = 'Shared from the device to your phone.';
+            return;
+          }
+        }
+
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = fileName;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+        exportNote.textContent = 'CSV downloaded to this device.';
+      } catch (error) {
+        exportNote.textContent = 'Export failed. Try again while connected to the device AP.';
+      } finally {
+        exportButton.disabled = false;
+        exportButton.textContent = 'Export data to phone';
+      }
+    }
+
+    exportButton.addEventListener('click', exportData);
+    window.addEventListener('resize', () => drawChart(lastHistoryPoints));
     setInterval(poll, 1000);
     poll();
   </script>

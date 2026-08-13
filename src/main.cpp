@@ -9,6 +9,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WebSerial.h>
 #include <SD_MMC.h>
 #include <LittleFS.h>
 #include <ESPAsyncWebServer.h>
@@ -80,6 +81,7 @@ void flushBufferToSD() {
   File f = SD_MMC.open(LOG_PATH, FILE_APPEND);
   if (!f) {
     Serial.println("[SD] failed to open log for append");
+    WebSerial.println("[SD] failed to open log for append");
     return;
   }
   for (size_t i = 0; i < bufferLen; i++) {
@@ -88,6 +90,7 @@ void flushBufferToSD() {
   }
   f.close();
   Serial.printf("[SD] flushed %u records\n", (unsigned)bufferLen);
+  WebSerial.printf("[SD] flushed %u records\n", (unsigned)bufferLen);
   bufferLen = 0;
 }
 
@@ -123,10 +126,18 @@ void sampleFlow() {
 
 // ---------- Web server routes --------------------------------------------
 void setupServer() {
+  WebSerial.begin(&server);
+
   if (!LittleFS.begin(true)) {
     Serial.println("[LittleFS] mount failed");
+    WebSerial.println("[LittleFS] mount failed");
   }
 
+  // WebSerial: bi-directional console over WebSocket, for debugging
+  /* Optional: Attach a callback to receive data from the web interface
+  WebSerial.onMessage([](uint8_t *data, size_t len) {
+    // Handle incoming commands if necessary
+  }); */
   // Serve the frontend from LittleFS (data/index.html -> uploaded via
   // `pio run --target uploadfs`), fully decoupled from firmware logic.
   server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
@@ -156,27 +167,38 @@ void setup() {
   pinMode(FLOW_SENSOR_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), onPulse, RISING);
 
+  WiFi.mode(WIFI_AP);
+  IPAddress local_IP(10, 0, 0, 1);     // Target IP address
+  IPAddress gateway(10, 0, 0, 1);      // Gateway (typically matches IP for AP)
+  IPAddress subnet(255, 255, 255, 0);  // Subnet mask
+  WiFi.softAPConfig(local_IP, gateway, subnet);
+  WiFi.softAP(AP_SSID, AP_PASS);
+
+  setupServer();
+
   // SD in 1-bit mode: frees D1/D2/D3 lines that camera would otherwise use.
   if (SD_MMC.begin("/sdcard", true)) {
     sdReady = true;
     ensureLogHeader();
     Serial.println("[SD] mounted ok (1-bit mode)");
+    WebSerial.println("[SD] mounted ok (1-bit mode)");
   } else {
     Serial.println("[SD] mount failed - logging disabled, AP+API still work");
+    WebSerial.println("[SD] mount failed - logging disabled, AP+API still work");
   }
 
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
   Serial.print("[AP] started, IP: ");
+  WebSerial.print("[AP] started, IP: ");
   Serial.println(WiFi.softAPIP());
-
-  setupServer();
+  WebSerial.println(WiFi.softAPIP());
 
   lastSampleMs = millis();
   lastFlushMs = millis();
 }
 
 void loop() {
+  WebSerial.loop();
+
   uint32_t now = millis();
 
   if (now - lastSampleMs >= SAMPLE_INTERVAL_MS) {

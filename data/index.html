@@ -301,7 +301,7 @@
       const height = canvas.clientHeight;
       context.clearRect(0, 0, width, height);
 
-      if (!points.length) {
+      if (!points.length || points.length < 2 || (points[points.length - 1].t_ms - points[0].t_ms) < 1000) {
         chartEmpty.hidden = false;
         chartEmpty.textContent = 'Collecting pulse history for the chart.';
         chartStatus.textContent = 'Waiting for samples';

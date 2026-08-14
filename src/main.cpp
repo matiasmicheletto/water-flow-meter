@@ -32,10 +32,26 @@ static const char* AP_PASS = "flowmeter123"; // 8+ chars required by WiFi lib
 
 // ---------- Shared state between ISR and loop -----------------------------
 volatile uint32_t pulseCount = 0;
+volatile uint32_t lastPulseMicros = 0;
+
+// Minimum time between counted pulses, in microseconds. Filters out noise/
+// ringing that would otherwise be counted as real pulses. Tune this down if
+// your real flow rate needs a higher max frequency than ~500 Hz allows;
+// tune it up if you still see suspiciously flat/maxed-out readings.
+static const uint32_t MIN_PULSE_INTERVAL_US = 2000; // caps at 500 Hz
 
 void IRAM_ATTR onPulse() {
-  pulseCount++;
+  uint32_t now = micros();
+  // micros() wraps every ~71 min; this subtraction is wrap-safe.
+  if ((uint32_t)(now - lastPulseMicros) >= MIN_PULSE_INTERVAL_US) {
+    pulseCount++;
+    lastPulseMicros = now;
+  }
 }
+
+// Guards SD_MMC access shared between loop() (sampling/flush) and the
+// AsyncTCP task (history/export handlers), which run concurrently.
+SemaphoreHandle_t sdMutex;
 
 // ---------- Record buffer ---------------------------------------------
 struct FlowRecord {
@@ -87,6 +103,7 @@ bool parseFlowRecordLine(const String &line, FlowRecord &record) {
 
 // ---------- SD helpers ---------------------------------------------------
 void ensureLogHeader() {
+  xSemaphoreTake(sdMutex, portMAX_DELAY);
   if (!SD_MMC.exists(LOG_PATH)) {
     File f = SD_MMC.open(LOG_PATH, FILE_WRITE);
     if (f) {
@@ -94,13 +111,16 @@ void ensureLogHeader() {
       f.close();
     }
   }
+  xSemaphoreGive(sdMutex);
 }
 
 void flushBufferToSD() {
   if (!sdReady || bufferLen == 0) return;
 
+  xSemaphoreTake(sdMutex, portMAX_DELAY);
   File f = SD_MMC.open(LOG_PATH, FILE_APPEND);
   if (!f) {
+    xSemaphoreGive(sdMutex);
     Serial.println("[SD] failed to open log for append");
     WebSerial.println("[SD] failed to open log for append");
     return;
@@ -110,6 +130,8 @@ void flushBufferToSD() {
              buffer[i].t_ms, buffer[i].pulses_sample, buffer[i].pulses_total_acc);
   }
   f.close();
+  xSemaphoreGive(sdMutex);
+
   Serial.printf("[SD] flushed %u records\n", (unsigned)bufferLen);
   WebSerial.printf("[SD] flushed %u records\n", (unsigned)bufferLen);
   bufferLen = 0;
@@ -179,9 +201,10 @@ void setupServer() {
   });
 
   server.on("/api/history", HTTP_GET, [](AsyncWebServerRequest *request) {
-    FlowRecord history[HISTORY_LIMIT];
+    static FlowRecord history[HISTORY_LIMIT]; // static: keeps it off the AsyncTCP task's stack
     size_t historyCount = 0;
 
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
     if (sdReady && SD_MMC.exists(LOG_PATH)) {
       File f = SD_MMC.open(LOG_PATH, FILE_READ);
       if (f) {
@@ -204,6 +227,7 @@ void setupServer() {
     for (size_t i = 0; i < bufferLen; i++) {
       appendHistoryRecord(history, historyCount, buffer[i]);
     }
+    xSemaphoreGive(sdMutex);
 
     JsonDocument doc;
     JsonArray points = doc["points"].to<JsonArray>();
@@ -226,6 +250,7 @@ void setupServer() {
     response->addHeader("Content-Disposition", "attachment; filename=flow-history.csv");
     response->print("t_ms,pulses_sample,pulses_total_acc\n");
 
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
     if (sdReady && SD_MMC.exists(LOG_PATH)) {
       File f = SD_MMC.open(LOG_PATH, FILE_READ);
       if (f) {
@@ -240,6 +265,7 @@ void setupServer() {
         f.close();
       }
     }
+    xSemaphoreGive(sdMutex);
 
     for (size_t i = 0; i < bufferLen; i++) {
       response->printf("%lu,%lu,%lu\n",
@@ -259,8 +285,20 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
+  sdMutex = xSemaphoreCreateMutex();
+
   pinMode(FLOW_SENSOR_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), onPulse, RISING);
+
+  // Mount SD before the server starts, so /api/history and /api/export.csv
+  // never race against the initial mount attempt.
+  if (SD_MMC.begin("/sdcard", true)) {
+    sdReady = true;
+    ensureLogHeader();
+    Serial.println("[SD] mounted ok (1-bit mode)");
+  } else {
+    Serial.println("[SD] mount failed - logging disabled, AP+API still work");
+  }
 
   WiFi.mode(WIFI_AP);
   IPAddress local_IP(10, 0, 0, 1);     // Target IP address
@@ -271,14 +309,9 @@ void setup() {
 
   setupServer();
 
-  // SD in 1-bit mode: frees D1/D2/D3 lines that camera would otherwise use.
-  if (SD_MMC.begin("/sdcard", true)) {
-    sdReady = true;
-    ensureLogHeader();
-    Serial.println("[SD] mounted ok (1-bit mode)");
+  if (sdReady) {
     WebSerial.println("[SD] mounted ok (1-bit mode)");
   } else {
-    Serial.println("[SD] mount failed - logging disabled, AP+API still work");
     WebSerial.println("[SD] mount failed - logging disabled, AP+API still work");
   }
 

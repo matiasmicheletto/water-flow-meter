@@ -54,30 +54,10 @@
     color: var(--muted);
   }
 
-  .reading {
-    display: flex;
-    align-items: flex-end;
-    gap: 10px;
-    flex-wrap: wrap;
-  }
-
-  .reading-value {
-    margin: 0;
-    font-size: clamp(2.4rem, 12vw, 4.6rem);
-    line-height: 0.95;
-    letter-spacing: -0.05em;
-  }
-
-  .reading-unit {
-    padding-bottom: 8px;
-    font-size: 0.95rem;
-    color: var(--muted);
-  }
-
   .hero-meta {
     margin-top: 16px;
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(1, minmax(0, 1fr));
     gap: 12px;
   }
 
@@ -98,8 +78,16 @@
 
   .metric-value {
     margin: 0;
-    font-size: 1.2rem;
+    font-size: 1.4rem;
     font-weight: 700;
+    letter-spacing: -0.02em;
+  }
+
+  .metric-unit {
+    margin-left: 6px;
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: var(--muted);
   }
 
   .panel {
@@ -204,6 +192,10 @@
       padding: 24px;
     }
 
+    .hero-meta {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
     .actions {
       grid-template-columns: auto 1fr;
       align-items: center;
@@ -215,26 +207,18 @@
   <main class="shell">
     <section class="hero">
       <p class="eyebrow">Water Flow Dashboard</p>
-      <div class="reading">
-        <h1 class="reading-value" id="flow-value">--</h1>
-        <span class="reading-unit">pulses / sample</span>
-      </div>
       <div class="hero-meta">
         <article class="metric">
+          <p class="metric-label">Current flow</p>
+          <p class="metric-value"><span id="flow-value">--</span><span class="metric-unit">pulses/min</span></p>
+        </article>
+        <article class="metric">
           <p class="metric-label">Elapsed time</p>
-          <p class="metric-value" id="elapsed">--:--</p>
+          <p class="metric-value" id="elapsed">--:--:--</p>
         </article>
         <article class="metric">
           <p class="metric-label">Total pulses</p>
           <p class="metric-value" id="total-pulses">--</p>
-        </article>
-        <article class="metric">
-          <p class="metric-label">Buffered samples</p>
-          <p class="metric-value" id="buffered">--</p>
-        </article>
-        <article class="metric">
-          <p class="metric-label">Storage</p>
-          <p class="metric-value" id="storage">--</p>
         </article>
       </div>
     </section>
@@ -242,20 +226,20 @@
     <section class="panel">
       <div class="panel-head">
         <div>
-          <h2 class="panel-title">Historical pulses</h2>
-          <p class="panel-copy">Relative timestamp from measurement start, sampled every second.</p>
+          <h2 class="panel-title">Minute Flow History</h2>
+          <p class="panel-copy">Complete session history. X axis: elapsed time. Y axis: pulses/min.</p>
         </div>
-        <span class="status-pill" id="chart-status">Waiting for samples</span>
+        <span class="status-pill" id="chart-status">Waiting for first minute</span>
       </div>
       <div class="chart-wrap">
         <canvas id="history-chart"></canvas>
-        <div class="chart-empty" id="chart-empty">Collecting pulse history for the chart.</div>
+        <div class="chart-empty" id="chart-empty">Collecting minute-level history.</div>
       </div>
     </section>
 
     <section class="panel actions">
       <button class="export-button" id="export-button" type="button">Export data to phone</button>
-      <p class="export-note" id="export-note">Creates a CSV with relative timestamps and pulse counts.</p>
+      <p class="export-note" id="export-note">Creates a CSV with 10-second measurements.</p>
     </section>
   </main>
 
@@ -263,26 +247,58 @@
     const flowValue = document.getElementById('flow-value');
     const elapsed = document.getElementById('elapsed');
     const totalPulses = document.getElementById('total-pulses');
-    const buffered = document.getElementById('buffered');
-    const storage = document.getElementById('storage');
     const chartStatus = document.getElementById('chart-status');
     const chartEmpty = document.getElementById('chart-empty');
     const exportButton = document.getElementById('export-button');
     const exportNote = document.getElementById('export-note');
     const canvas = document.getElementById('history-chart');
     const context = canvas.getContext('2d');
+    const CURRENT_POLL_MS = 2000;
+    const HISTORY_POLL_MS = 10000;
+
     let lastHistoryPoints = [];
+    let lastCurrent = null;
+    let lastCurrentReceivedAt = 0;
+    let currentOnline = false;
 
     function formatElapsed(ms) {
       const totalSeconds = Math.max(0, Math.floor(ms / 1000));
       const hours = Math.floor(totalSeconds / 3600);
       const minutes = Math.floor((totalSeconds % 3600) / 60);
       const seconds = totalSeconds % 60;
+      return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+    }
 
-      if (hours > 0) {
-        return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+    function formatNumberSI(value) {
+      const abs = Math.abs(value);
+      if (abs < 1000) {
+        return String(value);
       }
-      return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+      if (abs < 1000000) {
+        return `${(value / 1000).toFixed(value >= 100000 ? 0 : 1)}k`;
+      }
+      if (abs < 1000000000) {
+        return `${(value / 1000000).toFixed(value >= 100000000 ? 0 : 1)}M`;
+      }
+      return `${(value / 1000000000).toFixed(1)}B`;
+    }
+
+    function subsamplePoints(points, maxPoints) {
+      if (points.length <= maxPoints || maxPoints < 3) {
+        return points;
+      }
+
+      const result = [points[0]];
+      const innerCount = points.length - 2;
+      const keepInner = maxPoints - 2;
+      const step = Math.ceil(innerCount / keepInner);
+
+      for (let i = 1; i < points.length - 1; i += step) {
+        result.push(points[i]);
+      }
+
+      result.push(points[points.length - 1]);
+      return result;
     }
 
     function resizeCanvas() {
@@ -294,36 +310,15 @@
       context.setTransform(ratio, 0, 0, ratio, 0, 0);
     }
 
-    function drawChart(points) {
-      lastHistoryPoints = points;
-      resizeCanvas();
-      const width = canvas.clientWidth;
-      const height = canvas.clientHeight;
-      context.clearRect(0, 0, width, height);
-
-      if (!points.length || points.length < 2 || (points[points.length - 1].t_ms - points[0].t_ms) < 1000) {
-        chartEmpty.hidden = false;
-        chartEmpty.textContent = 'Collecting pulse history for the chart.';
-        chartStatus.textContent = 'Waiting for samples';
-        return;
-      }
-
-      chartEmpty.hidden = true;
-      chartStatus.textContent = `${points.length} points`;
-
-      const padding = { top: 18, right: 14, bottom: 32, left: 40 };
+    function drawAxes(padding, width, height, minTime, maxTime, maxPulse) {
       const innerWidth = width - padding.left - padding.right;
       const innerHeight = height - padding.top - padding.bottom;
-      const maxPulse = Math.max(...points.map((point) => point.pulses_sample), 1);
-      const minTime = points[0].t_ms;
-      const maxTime = points[points.length - 1].t_ms || minTime + 1;
-      const timeRange = Math.max(1, maxTime - minTime);
 
-      context.strokeStyle = 'rgba(23, 33, 31, 0.12)';
+      context.strokeStyle = 'rgba(23, 33, 31, 0.14)';
       context.lineWidth = 1;
       context.beginPath();
-      for (let index = 0; index < 4; index += 1) {
-        const y = padding.top + (innerHeight / 3) * index;
+      for (let idx = 0; idx < 4; idx += 1) {
+        const y = padding.top + (innerHeight / 3) * idx;
         context.moveTo(padding.left, y);
         context.lineTo(width - padding.right, y);
       }
@@ -340,21 +335,59 @@
       context.textAlign = 'right';
       context.fillText(formatElapsed(maxTime), width - padding.right, height - 8);
 
+      context.save();
+      context.translate(14, padding.top + innerHeight / 2);
+      context.rotate(-Math.PI / 2);
+      context.textAlign = 'center';
+      context.fillText('pulses/min', 0, 0);
+      context.restore();
+    }
+
+    function drawChart(points) {
+      lastHistoryPoints = points;
+      resizeCanvas();
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      context.clearRect(0, 0, width, height);
+
+      if (!points.length) {
+        chartEmpty.hidden = false;
+        chartEmpty.textContent = 'Collecting minute-level history.';
+        chartStatus.textContent = 'Waiting for first minute';
+        return;
+      }
+
+      const maxRenderablePoints = Math.max(150, Math.floor(width * 0.7));
+      const renderPoints = subsamplePoints(points, maxRenderablePoints);
+
+      chartEmpty.hidden = true;
+      chartStatus.textContent = `${points.length} minute points${renderPoints.length !== points.length ? ` (rendering ${renderPoints.length})` : ''}`;
+
+      const padding = { top: 18, right: 14, bottom: 32, left: 40 };
+      const innerWidth = width - padding.left - padding.right;
+      const innerHeight = height - padding.top - padding.bottom;
+      const maxPulse = Math.max(...renderPoints.map((point) => point.pulses_per_minute), 1);
+      const minTime = renderPoints[0].t_ms;
+      const maxTime = renderPoints[renderPoints.length - 1].t_ms || minTime + 1;
+      const timeRange = Math.max(1, maxTime - minTime);
+
+      drawAxes(padding, width, height, minTime, maxTime, maxPulse);
+
       const gradient = context.createLinearGradient(0, padding.top, 0, height - padding.bottom);
       gradient.addColorStop(0, 'rgba(15, 139, 109, 0.30)');
       gradient.addColorStop(1, 'rgba(15, 139, 109, 0.02)');
 
       context.beginPath();
-      points.forEach((point, index) => {
+      renderPoints.forEach((point, index) => {
         const x = padding.left + ((point.t_ms - minTime) / timeRange) * innerWidth;
-        const y = padding.top + innerHeight - (point.pulses_sample / maxPulse) * innerHeight;
+        const y = padding.top + innerHeight - (point.pulses_per_minute / maxPulse) * innerHeight;
         if (index === 0) {
           context.moveTo(x, y);
         } else {
           context.lineTo(x, y);
         }
       });
-      const lastX = padding.left + ((points[points.length - 1].t_ms - minTime) / timeRange) * innerWidth;
+      const lastX = padding.left + ((renderPoints[renderPoints.length - 1].t_ms - minTime) / timeRange) * innerWidth;
       context.lineTo(lastX, padding.top + innerHeight);
       context.lineTo(padding.left, padding.top + innerHeight);
       context.closePath();
@@ -362,9 +395,9 @@
       context.fill();
 
       context.beginPath();
-      points.forEach((point, index) => {
+      renderPoints.forEach((point, index) => {
         const x = padding.left + ((point.t_ms - minTime) / timeRange) * innerWidth;
-        const y = padding.top + innerHeight - (point.pulses_sample / maxPulse) * innerHeight;
+        const y = padding.top + innerHeight - (point.pulses_per_minute / maxPulse) * innerHeight;
         if (index === 0) {
           context.moveTo(x, y);
         } else {
@@ -394,24 +427,42 @@
       return res.json();
     }
 
-    async function poll() {
+    function updateElapsedFromLastCurrent() {
+      if (!lastCurrent || !currentOnline) {
+        elapsed.textContent = '--:--:--';
+        return;
+      }
+
+      const driftMs = Date.now() - lastCurrentReceivedAt;
+      elapsed.textContent = formatElapsed(lastCurrent.elapsed_ms + driftMs);
+    }
+
+    async function pollCurrent() {
       try {
-        const [current, history] = await Promise.all([loadCurrent(), loadHistory()]);
-        flowValue.textContent = current.pulses_sample;
-        elapsed.textContent = formatElapsed(current.t_ms);
-        totalPulses.textContent = current.pulses_total_acc;
-        buffered.textContent = current.buffered;
-        storage.textContent = current.sd_ready ? 'SD ready' : 'RAM only';
+        const current = await loadCurrent();
+        lastCurrent = current;
+        lastCurrentReceivedAt = Date.now();
+        currentOnline = true;
+
+        flowValue.textContent = String(current.pulses_per_minute ?? 0);
+        totalPulses.textContent = formatNumberSI(current.total_pulses ?? 0);
+        updateElapsedFromLastCurrent();
+      } catch (e) {
+        currentOnline = false;
+        flowValue.textContent = '--';
+        elapsed.textContent = '--:--:--';
+        totalPulses.textContent = '--';
+      }
+    }
+
+    async function pollHistory() {
+      try {
+        const history = await loadHistory();
         drawChart(history.points || []);
       } catch (e) {
-        flowValue.textContent = '--';
-        elapsed.textContent = '--:--';
-        totalPulses.textContent = '--';
-        buffered.textContent = '--';
-        storage.textContent = 'Offline';
         chartStatus.textContent = 'Connection lost';
         chartEmpty.hidden = false;
-        chartEmpty.textContent = 'Connection lost. Reconnect to reload live measurements.';
+        chartEmpty.textContent = 'Connection lost. Reconnect to reload history.';
       }
     }
 
@@ -461,8 +512,11 @@
 
     exportButton.addEventListener('click', exportData);
     window.addEventListener('resize', () => drawChart(lastHistoryPoints));
-    setInterval(poll, 1000);
-    poll();
+    setInterval(updateElapsedFromLastCurrent, 1000);
+    setInterval(pollCurrent, CURRENT_POLL_MS);
+    setInterval(pollHistory, HISTORY_POLL_MS);
+    pollCurrent();
+    pollHistory();
   </script>
 </body>
 </html>

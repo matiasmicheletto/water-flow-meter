@@ -12,6 +12,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <DNSServer.h>
 #include <WebSerial.h>
 #include <SD_MMC.h>
 #include <LittleFS.h>
@@ -34,6 +35,12 @@ static const size_t BUFFER_CAPACITY = 24;              // >4 minutes of 10s reco
 // ---------- AP credentials ---------------------------------------------
 static const char* AP_SSID = "FlowMeter";
 static const char* AP_PASS = "flowmeter123"; // 8+ chars required by WiFi lib
+
+// ---------- Captive portal ------------------------------------------------
+// Resolves every DNS query to the AP IP so OS captive-portal probes (and any
+// stray hostname lookups) land on this device instead of failing to resolve.
+static const byte DNS_PORT = 53;
+DNSServer dnsServer;
 
 // ---------- Shared state between ISR and loop -----------------------------
 volatile uint32_t pulseCount = 0;
@@ -417,6 +424,11 @@ void setupServer() {
     }
     bool isCurrentFile = (requestedFile == LOG_PATH);
 
+    if (!sdReady) {
+      request->send(503, "text/plain", "SD card not available");
+      return;
+    }
+
     String fileName = requestedFile;
     fileName.replace("/", "");
 
@@ -454,6 +466,24 @@ void setupServer() {
     request->send(response);
   });
 
+  // ---- Captive portal detection ----
+  // OS connectivity checks hit these fixed, well-known paths (any hostname,
+  // since DNS resolves everything to us). Redirecting them to "/" makes the
+  // OS recognize a captive portal and open it in a browser/portal webview.
+  auto redirectToApp = [](AsyncWebServerRequest *request) {
+    request->redirect("/");
+  };
+  server.on("/generate_204", HTTP_GET, redirectToApp);       // Android
+  server.on("/gen_204", HTTP_GET, redirectToApp);            // Android
+  server.on("/hotspot-detect.html", HTTP_GET, redirectToApp); // iOS/macOS
+  server.on("/connecttest.txt", HTTP_GET, redirectToApp);    // Windows
+  server.on("/ncsi.txt", HTTP_GET, redirectToApp);           // Windows
+  server.on("/success.txt", HTTP_GET, redirectToApp);        // ChromeOS/other
+
+  // Any other unmatched path (e.g. a probe using an unlisted URL/hostname)
+  // falls back to the app instead of a bare 404, so the portal still opens.
+  server.onNotFound(redirectToApp);
+
   server.begin();
 }
 
@@ -484,6 +514,10 @@ void setup() {
   WiFi.softAPConfig(local_IP, gateway, subnet); // URL is http://10.0.0.1:8080
   WiFi.softAP(AP_SSID, AP_PASS);
 
+  // Captive portal: resolve every hostname to the AP IP so phones detect
+  // this network as a captive portal and prompt the user to open it.
+  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+
   setupServer();
 
   if (sdReady) {
@@ -503,6 +537,7 @@ void setup() {
 
 void loop() {
   WebSerial.loop();
+  dnsServer.processNextRequest(); // lightweight, non-blocking DNS capture
 
   uint32_t now = millis();
 

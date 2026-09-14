@@ -3,7 +3,7 @@ import random
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
@@ -11,6 +11,9 @@ from fastapi.staticfiles import StaticFiles
 
 MEASUREMENT_INTERVAL_MS = 10_000
 HISTORY_INTERVAL_MS = 60_000
+# The real firmware creates a new log file per boot; the simulator only runs
+# a single session, so it exposes one fixed file name for API-contract parity.
+CURRENT_LOG_FILE = "/flow_log_sim.csv"
 
 
 class FlowSimulator:
@@ -106,6 +109,7 @@ class FlowSimulator:
                 "measurement_interval_ms": MEASUREMENT_INTERVAL_MS,
                 "has_measurement": self._has_measurement,
                 "sd_ready": True,
+                "current_file": CURRENT_LOG_FILE,
             }
 
     def snapshot_history(self) -> Dict[str, object]:
@@ -150,14 +154,23 @@ def api_current() -> Dict[str, int | bool]:
 
 
 @app.get("/api/history")
-def api_history() -> Dict[str, object]:
+def api_history(file: Optional[str] = None) -> Dict[str, object]:
     return sim.snapshot_history()
 
 
+@app.get("/api/files")
+def api_files() -> Dict[str, object]:
+    return {
+        "files": [{"name": CURRENT_LOG_FILE, "current": True}],
+        "current": CURRENT_LOG_FILE,
+    }
+
+
 @app.get("/api/export.csv", response_class=PlainTextResponse)
-def api_export_csv() -> PlainTextResponse:
+def api_export_csv(file: Optional[str] = None) -> PlainTextResponse:
     body = sim.export_csv()
-    headers = {"Content-Disposition": "attachment; filename=flow-history.csv"}
+    file_name = (file or CURRENT_LOG_FILE).lstrip("/")
+    headers = {"Content-Disposition": f"attachment; filename={file_name}"}
     return PlainTextResponse(content=body, media_type="text/csv", headers=headers)
 
 

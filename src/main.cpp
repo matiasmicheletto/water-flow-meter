@@ -17,6 +17,8 @@
 #include <LittleFS.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
+#include <vector>
+#include <algorithm>
 
 // ---------- Pin assignments (AI-Thinker ESP32-CAM, camera disabled) ------
 #define FLOW_SENSOR_PIN   13   // interrupt-capable, free when camera is off
@@ -26,7 +28,7 @@
 // ---------- Timing ---------------------------------------------------------
 static const uint32_t MEASUREMENT_INTERVAL_MS = 10000; // 10-second windows
 static const uint32_t HISTORY_INTERVAL_MS = 60000;     // 1 point per minute
-static const uint32_t FLUSH_INTERVAL_MS = 60000;       // persist roughly once per minute
+static const uint32_t FLUSH_INTERVAL_MS = 10000;       // persist every 10-second window
 static const size_t BUFFER_CAPACITY = 24;              // >4 minutes of 10s records
 
 // ---------- AP credentials ---------------------------------------------
@@ -77,7 +79,10 @@ uint32_t lastMeasurementMs = 0;
 uint32_t lastFlushMs = 0;
 
 bool sdReady = false;
-const char* LOG_PATH = "/flow_log.csv";
+// A fresh log file is created every boot (see initLogFile()); LOG_PATH
+// always points at the file for the current session.
+String LOG_PATH;
+const char* BOOT_SEQ_PATH = "/boot_seq.txt";
 
 AsyncWebServer server(80);
 
@@ -109,6 +114,30 @@ bool parseFlowRecordLine(const String &line, FlowRecord &record) {
 }
 
 // ---------- SD helpers ---------------------------------------------------
+// Reads/increments a persistent boot counter and returns a unique log path
+// for this session, e.g. "/flow_log_0007.csv". Must be called with sdMutex
+// already held or before the server/loop start touching SD.
+String allocateLogPath() {
+  unsigned long seq = 0;
+  if (SD_MMC.exists(BOOT_SEQ_PATH)) {
+    File f = SD_MMC.open(BOOT_SEQ_PATH, FILE_READ);
+    if (f) {
+      seq = f.parseInt();
+      f.close();
+    }
+  }
+
+  File f = SD_MMC.open(BOOT_SEQ_PATH, FILE_WRITE);
+  if (f) {
+    f.print(seq + 1);
+    f.close();
+  }
+
+  char path[32];
+  snprintf(path, sizeof(path), "/flow_log_%04lu.csv", seq);
+  return String(path);
+}
+
 void ensureLogHeader() {
   xSemaphoreTake(sdMutex, portMAX_DELAY);
   if (!SD_MMC.exists(LOG_PATH)) {
@@ -119,6 +148,40 @@ void ensureLogHeader() {
     }
   }
   xSemaphoreGive(sdMutex);
+}
+
+// Creates a brand-new log file for this boot session, so past runs are
+// preserved as separate files instead of being appended to.
+void initLogFile() {
+  xSemaphoreTake(sdMutex, portMAX_DELAY);
+  LOG_PATH = allocateLogPath();
+  xSemaphoreGive(sdMutex);
+  ensureLogHeader();
+}
+
+// Lists log files on SD (newest first), for the export file picker.
+std::vector<String> listLogFiles() {
+  std::vector<String> names;
+  xSemaphoreTake(sdMutex, portMAX_DELAY);
+  File root = SD_MMC.open("/");
+  if (root) {
+    File entry = root.openNextFile();
+    while (entry) {
+      String name = String(entry.name());
+      if (!name.startsWith("/")) {
+        name = "/" + name;
+      }
+      if (name.startsWith("/flow_log_") && name.endsWith(".csv")) {
+        names.push_back(name);
+      }
+      entry = root.openNextFile();
+    }
+    root.close();
+  }
+  xSemaphoreGive(sdMutex);
+
+  std::sort(names.begin(), names.end(), std::greater<String>());
+  return names;
 }
 
 void flushBufferToSD() {
@@ -207,6 +270,7 @@ void setupServer() {
     doc["measurement_interval_ms"] = MEASUREMENT_INTERVAL_MS;
     doc["has_measurement"] = hasMeasurement;
     doc["sd_ready"] = sdReady;
+    doc["current_file"] = LOG_PATH;
 
     String out;
     serializeJson(doc, out);
@@ -214,6 +278,12 @@ void setupServer() {
   });
 
   server.on("/api/history", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String requestedFile = LOG_PATH;
+    if (request->hasParam("file")) {
+      requestedFile = request->getParam("file")->value();
+    }
+    bool isCurrentFile = (requestedFile == LOG_PATH);
+
     AsyncResponseStream *response = request->beginResponseStream("application/json");
     response->print("{\"interval_ms\":");
     response->print(HISTORY_INTERVAL_MS);
@@ -281,8 +351,8 @@ void setupServer() {
     };
 
     xSemaphoreTake(sdMutex, portMAX_DELAY);
-    if (sdReady && SD_MMC.exists(LOG_PATH)) {
-      File f = SD_MMC.open(LOG_PATH, FILE_READ);
+    if (sdReady && SD_MMC.exists(requestedFile)) {
+      File f = SD_MMC.open(requestedFile, FILE_READ);
       if (f) {
         while (f.available()) {
           String line = f.readStringUntil('\n');
@@ -300,8 +370,10 @@ void setupServer() {
       }
     }
 
-    for (size_t i = 0; i < bufferLen; i++) {
-      consumeRecord(buffer[i]);
+    if (isCurrentFile) {
+      for (size_t i = 0; i < bufferLen; i++) {
+        consumeRecord(buffer[i]);
+      }
     }
     xSemaphoreGive(sdMutex);
 
@@ -318,14 +390,43 @@ void setupServer() {
     request->send(response);
   });
 
+  // Lists log files available on SD, newest first, so the dashboard can
+  // offer a file picker for export/history review.
+  server.on("/api/files", HTTP_GET, [](AsyncWebServerRequest *request) {
+    JsonDocument doc;
+    JsonArray files = doc["files"].to<JsonArray>();
+
+    if (sdReady) {
+      for (const String &name : listLogFiles()) {
+        JsonObject entry = files.add<JsonObject>();
+        entry["name"] = name;
+        entry["current"] = (name == LOG_PATH);
+      }
+    }
+    doc["current"] = LOG_PATH;
+
+    String out;
+    serializeJson(doc, out);
+    request->send(200, "application/json", out);
+  });
+
   server.on("/api/export.csv", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String requestedFile = LOG_PATH;
+    if (request->hasParam("file")) {
+      requestedFile = request->getParam("file")->value();
+    }
+    bool isCurrentFile = (requestedFile == LOG_PATH);
+
+    String fileName = requestedFile;
+    fileName.replace("/", "");
+
     AsyncResponseStream *response = request->beginResponseStream("text/csv");
-    response->addHeader("Content-Disposition", "attachment; filename=flow-history.csv");
+    response->addHeader("Content-Disposition", "attachment; filename=" + fileName);
     response->print("t_ms,pulse_count_10s,pulses_per_minute,total_pulses\n");
 
     xSemaphoreTake(sdMutex, portMAX_DELAY);
-    if (sdReady && SD_MMC.exists(LOG_PATH)) {
-      File f = SD_MMC.open(LOG_PATH, FILE_READ);
+    if (sdReady && SD_MMC.exists(requestedFile)) {
+      File f = SD_MMC.open(requestedFile, FILE_READ);
       if (f) {
         while (f.available()) {
           String line = f.readStringUntil('\n');
@@ -340,12 +441,14 @@ void setupServer() {
     }
     xSemaphoreGive(sdMutex);
 
-    for (size_t i = 0; i < bufferLen; i++) {
-      response->printf("%lu,%lu,%lu,%lu\n",
-                       buffer[i].t_ms,
-                       buffer[i].pulse_count_10s,
-                       buffer[i].pulses_per_minute,
-                       buffer[i].total_pulses);
+    if (isCurrentFile) {
+      for (size_t i = 0; i < bufferLen; i++) {
+        response->printf("%lu,%lu,%lu,%lu\n",
+                         buffer[i].t_ms,
+                         buffer[i].pulse_count_10s,
+                         buffer[i].pulses_per_minute,
+                         buffer[i].total_pulses);
+      }
     }
 
     request->send(response);
@@ -368,8 +471,8 @@ void setup() {
   // never race against the initial mount attempt.
   if (SD_MMC.begin("/sdcard", true)) {
     sdReady = true;
-    ensureLogHeader();
-    Serial.println("[SD] mounted ok (1-bit mode)");
+    initLogFile();
+    Serial.printf("[SD] mounted ok (1-bit mode), logging to %s\n", LOG_PATH.c_str());
   } else {
     Serial.println("[SD] mount failed - logging disabled, AP+API still work");
   }
@@ -384,7 +487,7 @@ void setup() {
   setupServer();
 
   if (sdReady) {
-    WebSerial.println("[SD] mounted ok (1-bit mode)");
+    WebSerial.printf("[SD] mounted ok (1-bit mode), logging to %s\n", LOG_PATH.c_str());
   } else {
     WebSerial.println("[SD] mount failed - logging disabled, AP+API still work");
   }

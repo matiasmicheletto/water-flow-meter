@@ -61,9 +61,11 @@ Where `t_ms` is elapsed milliseconds since ESP32 boot.
 
 ### SD logging
 
-- 10-second records are buffered in RAM and flushed periodically to SD.
-- SD remains the persistent source for full session history.
-- `/api/history` and `/api/export.csv` merge SD data plus current in-memory buffer.
+- A new log file is created every time the device boots (e.g. `/flow_log_0007.csv`), instead of appending to a single shared file.
+- A persistent boot counter (`/boot_seq.txt`) tracks the next file index across reboots.
+- 10-second records are buffered in RAM and flushed to SD every 10 seconds.
+- `/api/history` and `/api/export.csv` accept an optional `file` query parameter to target a specific log file; they default to the current session's file and merge it with the in-memory buffer.
+- `/api/files` lists all log files on SD (newest first) so the dashboard can offer a file picker.
 - No sliding-window truncation of history.
 
 ## Dashboard
@@ -83,6 +85,11 @@ Historical chart:
 - Frontend-only deterministic subsampling for rendering very large histories
 	- First and last points are preserved
 	- Underlying API history remains intact
+
+File selection:
+
+- A dropdown (populated from `/api/files`) lets the user pick a past session's log file or stay on the current session.
+- Selecting a file scopes both the historical chart and the CSV export to that file.
 
 Polling behavior:
 
@@ -130,6 +137,22 @@ Example:
 
 `partial_minute` is optional and appears only when the current minute is incomplete.
 
+Accepts an optional `file` query parameter (e.g. `/api/history?file=/flow_log_0003.csv`) to read a specific log file instead of the current session's file.
+
+### `GET /api/files`
+
+Lists log files on SD, newest first:
+
+```json
+{
+	"files": [
+		{ "name": "/flow_log_0007.csv", "current": true },
+		{ "name": "/flow_log_0006.csv", "current": false }
+	],
+	"current": "/flow_log_0007.csv"
+}
+```
+
 ### `GET /api/export.csv`
 
 Exports complete 10-second measurement history (SD + RAM buffer):
@@ -137,6 +160,8 @@ Exports complete 10-second measurement history (SD + RAM buffer):
 ```csv
 t_ms,pulse_count_10s,pulses_per_minute,total_pulses
 ```
+
+Accepts an optional `file` query parameter to export a specific log file instead of the current session's file.
 
 ## Running On Hardware (PlatformIO)
 

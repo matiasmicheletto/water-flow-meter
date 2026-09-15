@@ -65,6 +65,10 @@ void IRAM_ATTR onPulse() {
 // AsyncTCP task (history/export handlers), which run concurrently.
 SemaphoreHandle_t sdMutex;
 
+// Guards the RAM record buffer (buffer/bufferLen) shared between loop()
+// (sampling/flush) and the AsyncTCP task (history/export handlers).
+SemaphoreHandle_t bufferMutex;
+
 // ---------- Record buffer ---------------------------------------------
 struct FlowRecord {
   uint32_t t_ms;             // elapsed since boot, recorded at end of 10s window
@@ -118,6 +122,25 @@ bool parseFlowRecordLine(const String &line, FlowRecord &record) {
   }
 
   return false;
+}
+
+// Only accepts paths this firmware itself could have generated, so the
+// "file" query param can never be used to open arbitrary SD paths.
+bool isValidLogFile(const String &path) {
+  static const char *PREFIX = "/flow_log_";
+  static const char *SUFFIX = ".csv";
+  size_t prefixLen = strlen(PREFIX);
+  size_t suffixLen = strlen(SUFFIX);
+
+  if (path.length() <= prefixLen + suffixLen) return false;
+  if (!path.startsWith(PREFIX) || !path.endsWith(SUFFIX)) return false;
+
+  String middle = path.substring(prefixLen, path.length() - suffixLen);
+  if (middle.length() == 0) return false;
+  for (size_t i = 0; i < middle.length(); i++) {
+    if (!isDigit(middle[i])) return false;
+  }
+  return true;
 }
 
 // ---------- SD helpers ---------------------------------------------------
@@ -192,7 +215,20 @@ std::vector<String> listLogFiles() {
 }
 
 void flushBufferToSD() {
-  if (!sdReady || bufferLen == 0) return;
+  if (!sdReady) return;
+
+  // Snapshot under the buffer lock, then release it before touching SD so
+  // concurrent /api/history and /api/export.csv reads are never blocked by
+  // slow SD I/O.
+  FlowRecord snapshot[BUFFER_CAPACITY];
+  size_t snapshotLen;
+
+  xSemaphoreTake(bufferMutex, portMAX_DELAY);
+  snapshotLen = bufferLen;
+  memcpy(snapshot, buffer, sizeof(FlowRecord) * snapshotLen);
+  xSemaphoreGive(bufferMutex);
+
+  if (snapshotLen == 0) return;
 
   xSemaphoreTake(sdMutex, portMAX_DELAY);
   File f = SD_MMC.open(LOG_PATH, FILE_APPEND);
@@ -202,19 +238,27 @@ void flushBufferToSD() {
     WebSerial.println("[SD] failed to open log for append");
     return;
   }
-  for (size_t i = 0; i < bufferLen; i++) {
+  for (size_t i = 0; i < snapshotLen; i++) {
     f.printf("%lu,%lu,%lu,%lu\n",
-             buffer[i].t_ms,
-             buffer[i].pulse_count_10s,
-             buffer[i].pulses_per_minute,
-             buffer[i].total_pulses);
+             snapshot[i].t_ms,
+             snapshot[i].pulse_count_10s,
+             snapshot[i].pulses_per_minute,
+             snapshot[i].total_pulses);
   }
   f.close();
   xSemaphoreGive(sdMutex);
 
-  Serial.printf("[SD] flushed %u records\n", (unsigned)bufferLen);
-  WebSerial.printf("[SD] flushed %u records\n", (unsigned)bufferLen);
-  bufferLen = 0;
+  // Only drop the records we actually persisted; anything appended while we
+  // were writing to SD (e.g. sampleFlow's buffer-full retry) stays queued.
+  xSemaphoreTake(bufferMutex, portMAX_DELAY);
+  if (bufferLen >= snapshotLen) {
+    memmove(buffer, buffer + snapshotLen, sizeof(FlowRecord) * (bufferLen - snapshotLen));
+    bufferLen -= snapshotLen;
+  }
+  xSemaphoreGive(bufferMutex);
+
+  Serial.printf("[SD] flushed %u records\n", (unsigned)snapshotLen);
+  WebSerial.printf("[SD] flushed %u records\n", (unsigned)snapshotLen);
 }
 
 // ---------- Sensor sampling ---------------------------------------------
@@ -238,14 +282,21 @@ void sampleFlow(uint32_t measurementElapsedMs) {
   record.pulses_per_minute = pulsesPerMinute;
   record.total_pulses = totalPulses;
 
-  if (bufferLen < BUFFER_CAPACITY) {
+  xSemaphoreTake(bufferMutex, portMAX_DELAY);
+  bool bufferFull = (bufferLen >= BUFFER_CAPACITY);
+  if (!bufferFull) {
     buffer[bufferLen++] = record;
-  } else {
+  }
+  xSemaphoreGive(bufferMutex);
+
+  if (bufferFull) {
     // buffer full before scheduled flush - flush now to avoid losing data
     flushBufferToSD();
+    xSemaphoreTake(bufferMutex, portMAX_DELAY);
     if (bufferLen < BUFFER_CAPACITY) {
       buffer[bufferLen++] = record;
     }
+    xSemaphoreGive(bufferMutex);
   }
 }
 
@@ -288,6 +339,10 @@ void setupServer() {
     String requestedFile = LOG_PATH;
     if (request->hasParam("file")) {
       requestedFile = request->getParam("file")->value();
+      if (!isValidLogFile(requestedFile)) {
+        request->send(400, "text/plain", "Invalid log file");
+        return;
+      }
     }
     bool isCurrentFile = (requestedFile == LOG_PATH);
 
@@ -376,13 +431,20 @@ void setupServer() {
         f.close();
       }
     }
+    xSemaphoreGive(sdMutex);
 
     if (isCurrentFile) {
-      for (size_t i = 0; i < bufferLen; i++) {
-        consumeRecord(buffer[i]);
+      FlowRecord snapshot[BUFFER_CAPACITY];
+      size_t snapshotLen;
+      xSemaphoreTake(bufferMutex, portMAX_DELAY);
+      snapshotLen = bufferLen;
+      memcpy(snapshot, buffer, sizeof(FlowRecord) * snapshotLen);
+      xSemaphoreGive(bufferMutex);
+
+      for (size_t i = 0; i < snapshotLen; i++) {
+        consumeRecord(snapshot[i]);
       }
     }
-    xSemaphoreGive(sdMutex);
 
     finalizeMinute();
 
@@ -421,6 +483,10 @@ void setupServer() {
     String requestedFile = LOG_PATH;
     if (request->hasParam("file")) {
       requestedFile = request->getParam("file")->value();
+      if (!isValidLogFile(requestedFile)) {
+        request->send(400, "text/plain", "Invalid log file");
+        return;
+      }
     }
     bool isCurrentFile = (requestedFile == LOG_PATH);
 
@@ -454,12 +520,19 @@ void setupServer() {
     xSemaphoreGive(sdMutex);
 
     if (isCurrentFile) {
-      for (size_t i = 0; i < bufferLen; i++) {
+      FlowRecord snapshot[BUFFER_CAPACITY];
+      size_t snapshotLen;
+      xSemaphoreTake(bufferMutex, portMAX_DELAY);
+      snapshotLen = bufferLen;
+      memcpy(snapshot, buffer, sizeof(FlowRecord) * snapshotLen);
+      xSemaphoreGive(bufferMutex);
+
+      for (size_t i = 0; i < snapshotLen; i++) {
         response->printf("%lu,%lu,%lu,%lu\n",
-                         buffer[i].t_ms,
-                         buffer[i].pulse_count_10s,
-                         buffer[i].pulses_per_minute,
-                         buffer[i].total_pulses);
+                         snapshot[i].t_ms,
+                         snapshot[i].pulse_count_10s,
+                         snapshot[i].pulses_per_minute,
+                         snapshot[i].total_pulses);
       }
     }
 
@@ -480,9 +553,15 @@ void setupServer() {
   server.on("/ncsi.txt", HTTP_GET, redirectToApp);           // Windows
   server.on("/success.txt", HTTP_GET, redirectToApp);        // ChromeOS/other
 
-  // Any other unmatched path (e.g. a probe using an unlisted URL/hostname)
-  // falls back to the app instead of a bare 404, so the portal still opens.
-  server.onNotFound(redirectToApp);
+  // Any other unmatched path falls back to the app so the portal still
+  // opens, except unknown /api/ routes which must surface as real 404s.
+  server.onNotFound([redirectToApp](AsyncWebServerRequest *request) {
+    if (request->url().startsWith("/api/")) {
+      request->send(404, "application/json", "{\"error\":\"Not found\"}");
+      return;
+    }
+    redirectToApp(request);
+  });
 
   server.begin();
 }
@@ -493,6 +572,7 @@ void setup() {
   delay(200);
 
   sdMutex = xSemaphoreCreateMutex();
+  bufferMutex = xSemaphoreCreateMutex();
 
   pinMode(FLOW_SENSOR_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), onPulse, RISING);
@@ -511,7 +591,7 @@ void setup() {
   IPAddress local_IP(10, 0, 0, 1);     // Target IP address
   IPAddress gateway(10, 0, 0, 1);      // Gateway (typically matches IP for AP)
   IPAddress subnet(255, 255, 255, 0);  // Subnet mask
-  WiFi.softAPConfig(local_IP, gateway, subnet); // URL is http://10.0.0.1:8080
+  WiFi.softAPConfig(local_IP, gateway, subnet); // URL is http://10.0.0.1/
   WiFi.softAP(AP_SSID, AP_PASS);
 
   // Captive portal: resolve every hostname to the AP IP so phones detect
@@ -526,10 +606,8 @@ void setup() {
     WebSerial.println("[SD] mount failed - logging disabled, AP+API still work");
   }
 
-  Serial.print("[AP] started, IP: ");
-  WebSerial.print("[AP] started, IP: ");
-  Serial.println(WiFi.softAPIP());
-  WebSerial.println(WiFi.softAPIP());
+  Serial.printf("[AP] started, IP: %s\n", WiFi.softAPIP().toString().c_str());
+  WebSerial.printf("[AP] started, IP: %s\n", WiFi.softAPIP().toString().c_str());
 
   lastMeasurementMs = millis();
   lastFlushMs = millis();

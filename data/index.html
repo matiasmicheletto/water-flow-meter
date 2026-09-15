@@ -97,7 +97,13 @@
     background: var(--panel);
     box-shadow: var(--shadow);
     border: 1px solid rgba(255, 255, 255, 0.7);
-    backdrop-filter: blur(8px);
+  }
+
+  @supports ((-webkit-backdrop-filter: blur(8px)) or (backdrop-filter: blur(8px))) {
+    .panel {
+      -webkit-backdrop-filter: blur(8px);
+      backdrop-filter: blur(8px);
+    }
   }
 
   .panel-head {
@@ -132,12 +138,19 @@
     position: relative;
     margin-top: 8px;
     width: 100%;
-    aspect-ratio: 16 / 10;
-    min-height: 240px;
+    height: 260px;
     border-radius: 18px;
     overflow: hidden;
     background: linear-gradient(180deg, rgba(255,255,255,0.84), rgba(246,241,232,0.94));
     border: 1px solid rgba(23, 33, 31, 0.07);
+  }
+
+  @supports (aspect-ratio: 16 / 10) {
+    .chart-wrap {
+      height: auto;
+      min-height: 240px;
+      aspect-ratio: 16 / 10;
+    }
   }
 
   canvas {
@@ -257,59 +270,123 @@
   </main>
 
   <script>
-    const flowValue = document.getElementById('flow-value');
-    const elapsed = document.getElementById('elapsed');
-    const totalPulses = document.getElementById('total-pulses');
-    const chartStatus = document.getElementById('chart-status');
-    const chartEmpty = document.getElementById('chart-empty');
-    const exportButton = document.getElementById('export-button');
-    const exportNote = document.getElementById('export-note');
-    const fileSelect = document.getElementById('file-select');
-    const canvas = document.getElementById('history-chart');
-    const context = canvas.getContext('2d');
-    const CURRENT_POLL_MS = 2000;
-    const HISTORY_POLL_MS = 10000;
-    const FILES_POLL_MS = 15000;
+    var flowValue = document.getElementById('flow-value');
+    var elapsed = document.getElementById('elapsed');
+    var totalPulses = document.getElementById('total-pulses');
+    var chartStatus = document.getElementById('chart-status');
+    var chartEmpty = document.getElementById('chart-empty');
+    var exportButton = document.getElementById('export-button');
+    var exportNote = document.getElementById('export-note');
+    var fileSelect = document.getElementById('file-select');
+    var canvas = document.getElementById('history-chart');
+    var context = canvas.getContext('2d');
+    var CURRENT_POLL_MS = 2000;
+    var HISTORY_POLL_MS = 10000;
+    var FILES_POLL_MS = 15000;
 
-    let lastHistoryPoints = [];
-    let lastCurrent = null;
-    let lastCurrentReceivedAt = 0;
-    let currentOnline = false;
-    let currentLogFile = '';
+    var lastHistoryPoints = [];
+    var lastCurrent = null;
+    var lastCurrentReceivedAt = 0;
+    var currentOnline = false;
+    var currentLogFile = '';
+
+    function pad2(value) {
+      if (value < 10) {
+        return '0' + value;
+      }
+      return String(value);
+    }
 
     function formatElapsed(ms) {
-      const totalSeconds = Math.max(0, Math.floor(ms / 1000));
-      const hours = Math.floor(totalSeconds / 3600);
-      const minutes = Math.floor((totalSeconds % 3600) / 60);
-      const seconds = totalSeconds % 60;
-      return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+      var totalSeconds = Math.max(0, Math.floor(ms / 1000));
+      var hours = Math.floor(totalSeconds / 3600);
+      var minutes = Math.floor((totalSeconds % 3600) / 60);
+      var seconds = totalSeconds % 60;
+      return pad2(hours) + ':' + pad2(minutes) + ':' + pad2(seconds);
     }
 
     function formatNumberSI(value) {
-      const abs = Math.abs(value);
+      var abs = Math.abs(value);
       if (abs < 1000) {
         return String(value);
       }
       if (abs < 1000000) {
-        return `${(value / 1000).toFixed(value >= 100000 ? 0 : 1)}k`;
+        return (value / 1000).toFixed(value >= 100000 ? 0 : 1) + 'k';
       }
       if (abs < 1000000000) {
-        return `${(value / 1000000).toFixed(value >= 100000000 ? 0 : 1)}M`;
+        return (value / 1000000).toFixed(value >= 100000000 ? 0 : 1) + 'M';
       }
-      return `${(value / 1000000000).toFixed(1)}B`;
+      return (value / 1000000000).toFixed(1) + 'B';
+    }
+
+    function setHidden(element, hidden) {
+      if (hidden) {
+        element.setAttribute('hidden', 'hidden');
+      } else {
+        element.removeAttribute('hidden');
+      }
+    }
+
+    function getJSON(url, onSuccess, onError) {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', url, true);
+      xhr.onreadystatechange = function () {
+        if (xhr.readyState !== 4) {
+          return;
+        }
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            onSuccess(JSON.parse(xhr.responseText || '{}'));
+          } catch (parseError) {
+            onError(parseError);
+          }
+          return;
+        }
+        onError(new Error('Request failed: ' + xhr.status));
+      };
+      xhr.onerror = function () {
+        onError(new Error('Network error'));
+      };
+      xhr.send();
+    }
+
+    function getBlob(url, onSuccess, onError) {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', url, true);
+      xhr.responseType = 'blob';
+      xhr.onreadystatechange = function () {
+        if (xhr.readyState !== 4) {
+          return;
+        }
+        if (xhr.status >= 200 && xhr.status < 300) {
+          onSuccess(xhr.response);
+          return;
+        }
+        onError(new Error('Request failed: ' + xhr.status));
+      };
+      xhr.onerror = function () {
+        onError(new Error('Network error'));
+      };
+      xhr.send();
     }
 
     function subsamplePoints(points, maxPoints) {
+      var i;
+      var result;
+      var innerCount;
+      var keepInner;
+      var step;
+
       if (points.length <= maxPoints || maxPoints < 3) {
         return points;
       }
 
-      const result = [points[0]];
-      const innerCount = points.length - 2;
-      const keepInner = maxPoints - 2;
-      const step = Math.ceil(innerCount / keepInner);
+      result = [points[0]];
+      innerCount = points.length - 2;
+      keepInner = maxPoints - 2;
+      step = Math.ceil(innerCount / keepInner);
 
-      for (let i = 1; i < points.length - 1; i += step) {
+      for (i = 1; i < points.length - 1; i += step) {
         result.push(points[i]);
       }
 
@@ -318,23 +395,24 @@
     }
 
     function resizeCanvas() {
-      const ratio = window.devicePixelRatio || 1;
-      const width = canvas.clientWidth;
-      const height = canvas.clientHeight;
+      var ratio = window.devicePixelRatio || 1;
+      var width = canvas.clientWidth;
+      var height = canvas.clientHeight;
       canvas.width = Math.floor(width * ratio);
       canvas.height = Math.floor(height * ratio);
       context.setTransform(ratio, 0, 0, ratio, 0, 0);
     }
 
     function drawAxes(padding, width, height, minTime, maxTime, maxPulse) {
-      const innerWidth = width - padding.left - padding.right;
-      const innerHeight = height - padding.top - padding.bottom;
+      var innerHeight = height - padding.top - padding.bottom;
+      var idx;
+      var y;
 
       context.strokeStyle = 'rgba(23, 33, 31, 0.14)';
       context.lineWidth = 1;
       context.beginPath();
-      for (let idx = 0; idx < 4; idx += 1) {
-        const y = padding.top + (innerHeight / 3) * idx;
+      for (idx = 0; idx < 4; idx += 1) {
+        y = padding.top + (innerHeight / 3) * idx;
         context.moveTo(padding.left, y);
         context.lineTo(width - padding.right, y);
       }
@@ -359,51 +437,88 @@
       context.restore();
     }
 
+    function computeMaxPulse(points) {
+      var maxPulse = 1;
+      var i;
+      var value;
+      for (i = 0; i < points.length; i += 1) {
+        value = points[i].pulses_per_minute;
+        if (value > maxPulse) {
+          maxPulse = value;
+        }
+      }
+      return maxPulse;
+    }
+
     function drawChart(points) {
+      var width;
+      var height;
+      var maxRenderablePoints;
+      var renderPoints;
+      var padding;
+      var innerWidth;
+      var innerHeight;
+      var maxPulse;
+      var minTime;
+      var maxTime;
+      var timeRange;
+      var gradient;
+      var i;
+      var point;
+      var x;
+      var y;
+      var lastX;
+      var statusText;
+
       lastHistoryPoints = points;
       resizeCanvas();
-      const width = canvas.clientWidth;
-      const height = canvas.clientHeight;
+      width = canvas.clientWidth;
+      height = canvas.clientHeight;
       context.clearRect(0, 0, width, height);
 
       if (!points.length) {
-        chartEmpty.hidden = false;
-        chartEmpty.textContent = 'Registrando datos históricos.';
+        setHidden(chartEmpty, false);
+        chartEmpty.textContent = 'Registrando datos historicos.';
         chartStatus.textContent = 'Esperando inicio';
         return;
       }
 
-      const maxRenderablePoints = Math.max(150, Math.floor(width * 0.7));
-      const renderPoints = subsamplePoints(points, maxRenderablePoints);
+      maxRenderablePoints = Math.max(150, Math.floor(width * 0.7));
+      renderPoints = subsamplePoints(points, maxRenderablePoints);
 
-      chartEmpty.hidden = true;
-      chartStatus.textContent = `${points.length} datos${renderPoints.length !== points.length ? ` (rendering ${renderPoints.length})` : ''}`;
+      setHidden(chartEmpty, true);
+      statusText = String(points.length) + ' datos';
+      if (renderPoints.length !== points.length) {
+        statusText += ' (rendering ' + renderPoints.length + ')';
+      }
+      chartStatus.textContent = statusText;
 
-      const padding = { top: 18, right: 14, bottom: 32, left: 40 };
-      const innerWidth = width - padding.left - padding.right;
-      const innerHeight = height - padding.top - padding.bottom;
-      const maxPulse = Math.max(...renderPoints.map((point) => point.pulses_per_minute), 1);
-      const minTime = renderPoints[0].t_ms;
-      const maxTime = renderPoints[renderPoints.length - 1].t_ms || minTime + 1;
-      const timeRange = Math.max(1, maxTime - minTime);
+      padding = { top: 18, right: 14, bottom: 32, left: 40 };
+      innerWidth = width - padding.left - padding.right;
+      innerHeight = height - padding.top - padding.bottom;
+      maxPulse = computeMaxPulse(renderPoints);
+      minTime = renderPoints[0].t_ms;
+      maxTime = renderPoints[renderPoints.length - 1].t_ms || (minTime + 1);
+      timeRange = Math.max(1, maxTime - minTime);
 
       drawAxes(padding, width, height, minTime, maxTime, maxPulse);
 
-      const gradient = context.createLinearGradient(0, padding.top, 0, height - padding.bottom);
+      gradient = context.createLinearGradient(0, padding.top, 0, height - padding.bottom);
       gradient.addColorStop(0, 'rgba(15, 139, 109, 0.30)');
       gradient.addColorStop(1, 'rgba(15, 139, 109, 0.02)');
 
       context.beginPath();
-      renderPoints.forEach((point, index) => {
-        const x = padding.left + ((point.t_ms - minTime) / timeRange) * innerWidth;
-        const y = padding.top + innerHeight - (point.pulses_per_minute / maxPulse) * innerHeight;
-        if (index === 0) {
+      for (i = 0; i < renderPoints.length; i += 1) {
+        point = renderPoints[i];
+        x = padding.left + ((point.t_ms - minTime) / timeRange) * innerWidth;
+        y = padding.top + innerHeight - (point.pulses_per_minute / maxPulse) * innerHeight;
+        if (i === 0) {
           context.moveTo(x, y);
         } else {
           context.lineTo(x, y);
         }
-      });
-      const lastX = padding.left + ((renderPoints[renderPoints.length - 1].t_ms - minTime) / timeRange) * innerWidth;
+      }
+      lastX = padding.left + ((renderPoints[renderPoints.length - 1].t_ms - minTime) / timeRange) * innerWidth;
       context.lineTo(lastX, padding.top + innerHeight);
       context.lineTo(padding.left, padding.top + innerHeight);
       context.closePath();
@@ -411,15 +526,16 @@
       context.fill();
 
       context.beginPath();
-      renderPoints.forEach((point, index) => {
-        const x = padding.left + ((point.t_ms - minTime) / timeRange) * innerWidth;
-        const y = padding.top + innerHeight - (point.pulses_per_minute / maxPulse) * innerHeight;
-        if (index === 0) {
+      for (i = 0; i < renderPoints.length; i += 1) {
+        point = renderPoints[i];
+        x = padding.left + ((point.t_ms - minTime) / timeRange) * innerWidth;
+        y = padding.top + innerHeight - (point.pulses_per_minute / maxPulse) * innerHeight;
+        if (i === 0) {
           context.moveTo(x, y);
         } else {
           context.lineTo(x, y);
         }
-      });
+      }
       context.strokeStyle = '#0f8b6d';
       context.lineWidth = 3;
       context.lineJoin = 'round';
@@ -427,136 +543,150 @@
       context.stroke();
     }
 
-    async function loadCurrent() {
-      const res = await fetch('/api/current');
-      if (!res.ok) {
-        throw new Error('current request failed');
-      }
-      return res.json();
-    }
-
-    async function loadHistory() {
-      const params = fileSelect.value ? `?file=${encodeURIComponent(fileSelect.value)}` : '';
-      const res = await fetch(`/api/history${params}`);
-      if (!res.ok) {
-        throw new Error('history request failed');
-      }
-      return res.json();
-    }
-
-    async function loadFiles() {
-      const res = await fetch('/api/files');
-      if (!res.ok) {
-        throw new Error('files request failed');
-      }
-      return res.json();
-    }
-
     function updateElapsedFromLastCurrent() {
+      var driftMs;
       if (!lastCurrent || !currentOnline) {
         elapsed.textContent = '--:--:--';
         return;
       }
 
-      const driftMs = Date.now() - lastCurrentReceivedAt;
-      elapsed.textContent = formatElapsed(lastCurrent.elapsed_ms + driftMs);
+      driftMs = Date.now() - lastCurrentReceivedAt;
+      elapsed.textContent = formatElapsed((lastCurrent.elapsed_ms || 0) + driftMs);
     }
 
-    async function pollCurrent() {
-      try {
-        const current = await loadCurrent();
+    function pollCurrent() {
+      getJSON('/api/current', function (current) {
         lastCurrent = current;
         lastCurrentReceivedAt = Date.now();
         currentOnline = true;
-
-        flowValue.textContent = String(current.pulses_per_minute ?? 0);
-        totalPulses.textContent = formatNumberSI(current.total_pulses ?? 0);
+        flowValue.textContent = String(current.pulses_per_minute != null ? current.pulses_per_minute : 0);
+        totalPulses.textContent = formatNumberSI(current.total_pulses != null ? current.total_pulses : 0);
         updateElapsedFromLastCurrent();
-      } catch (e) {
+      }, function () {
         currentOnline = false;
         flowValue.textContent = '--';
         elapsed.textContent = '--:--:--';
         totalPulses.textContent = '--';
-      }
+      });
     }
 
-    async function pollHistory() {
-      try {
-        const history = await loadHistory();
+    function pollHistory() {
+      var params = fileSelect.value ? ('?file=' + encodeURIComponent(fileSelect.value)) : '';
+      getJSON('/api/history' + params, function (history) {
         drawChart(history.points || []);
-      } catch (e) {
+      }, function () {
         chartStatus.textContent = 'Connection lost';
-        chartEmpty.hidden = false;
+        setHidden(chartEmpty, false);
         chartEmpty.textContent = 'Connection lost. Reconnect to reload history.';
-      }
+      });
     }
 
-    async function pollFiles() {
-      try {
-        const data = await loadFiles();
+    function pollFiles() {
+      getJSON('/api/files', function (data) {
+        var selectedValue = fileSelect.value;
+        var files = data.files || [];
+        var options = ['<option value="">Sesion actual</option>'];
+        var i;
+        var entry;
+        var label;
+
         currentLogFile = data.current || '';
-        const selectedValue = fileSelect.value;
-        const options = ['<option value="">Sesión actual</option>'];
-        (data.files || []).forEach((entry) => {
-          const label = entry.current ? `${entry.name} (actual)` : entry.name;
-          options.push(`<option value="${entry.name}">${label}</option>`);
-        });
+
+        for (i = 0; i < files.length; i += 1) {
+          entry = files[i];
+          label = entry.current ? (entry.name + ' (actual)') : entry.name;
+          options.push('<option value="' + entry.name + '">' + label + '</option>');
+        }
         fileSelect.innerHTML = options.join('');
         fileSelect.value = selectedValue;
-      } catch (e) {
+      }, function () {
         // Keep whatever options are already shown; retry on next poll.
+      });
+    }
+
+    function attemptNativeShare(blob, fileName, onShared, onFallback) {
+      try {
+        if (!navigator || !navigator.share || !navigator.canShare || typeof File === 'undefined') {
+          onFallback();
+          return;
+        }
+
+        var file = new File([blob], fileName, { type: 'text/csv' });
+        if (!navigator.canShare({ files: [file] })) {
+          onFallback();
+          return;
+        }
+
+        navigator.share({
+          files: [file],
+          title: 'Flow history export',
+          text: 'Pulse history from the flow meter'
+        }).then(function () {
+          onShared();
+        }).catch(function () {
+          onFallback();
+        });
+      } catch (e) {
+        onFallback();
       }
     }
 
-    async function exportData() {
+    function downloadBlob(blob, fileName) {
+      var urlCreator = window.URL || window.webkitURL;
+      if (!urlCreator || !urlCreator.createObjectURL) {
+        throw new Error('Blob URL not supported');
+      }
+
+      var url = urlCreator.createObjectURL(blob);
+      var link = document.createElement('a');
+      link.href = url;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      if (urlCreator.revokeObjectURL) {
+        urlCreator.revokeObjectURL(url);
+      }
+    }
+
+    function exportData() {
+      var params;
+
       exportButton.disabled = true;
       exportButton.textContent = 'Preparing export...';
       exportNote.textContent = 'Collecting the CSV from the device.';
 
-      try {
-        const params = fileSelect.value ? `?file=${encodeURIComponent(fileSelect.value)}` : '';
-        const response = await fetch(`/api/export.csv${params}`);
-        if (!response.ok) {
-          throw new Error('export failed');
-        }
+      params = fileSelect.value ? ('?file=' + encodeURIComponent(fileSelect.value)) : '';
+      getBlob('/api/export.csv' + params, function (blob) {
+        var selectedName = (fileSelect.value || currentLogFile || 'flow-history.csv').replace(/^\//, '');
+        var fileName = selectedName || ('flow-history-' + Date.now() + '.csv');
 
-        const blob = await response.blob();
-        const selectedName = (fileSelect.value || currentLogFile || 'flow-history.csv').replace(/^\//, '');
-        const fileName = selectedName || `flow-history-${Date.now()}.csv`;
-
-        if (navigator.canShare && navigator.share) {
-          const file = new File([blob], fileName, { type: 'text/csv' });
-          if (navigator.canShare({ files: [file] })) {
-            await navigator.share({
-              files: [file],
-              title: 'Flow history export',
-              text: 'Pulse history from the flow meter'
-            });
-            exportNote.textContent = 'Shared from the device to your phone.';
-            return;
+        attemptNativeShare(blob, fileName, function () {
+          exportNote.textContent = 'Shared from the device to your phone.';
+          exportButton.disabled = false;
+          exportButton.textContent = 'Export data to phone';
+        }, function () {
+          try {
+            downloadBlob(blob, fileName);
+            exportNote.textContent = 'CSV downloaded to this device.';
+          } catch (e) {
+            exportNote.textContent = 'Export failed. Browser blocks download on this device.';
           }
-        }
-
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = fileName;
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        URL.revokeObjectURL(url);
-        exportNote.textContent = 'CSV downloaded to this device.';
-      } catch (error) {
+          exportButton.disabled = false;
+          exportButton.textContent = 'Export data to phone';
+        });
+      }, function () {
         exportNote.textContent = 'Export failed. Try again while connected to the device AP.';
-      } finally {
         exportButton.disabled = false;
         exportButton.textContent = 'Export data to phone';
-      }
+      });
     }
 
     exportButton.addEventListener('click', exportData);
     fileSelect.addEventListener('change', pollHistory);
-    window.addEventListener('resize', () => drawChart(lastHistoryPoints));
+    window.addEventListener('resize', function () {
+      drawChart(lastHistoryPoints);
+    });
     setInterval(updateElapsedFromLastCurrent, 1000);
     setInterval(pollCurrent, CURRENT_POLL_MS);
     setInterval(pollHistory, HISTORY_POLL_MS);

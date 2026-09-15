@@ -171,6 +171,10 @@
     font-size: 0.95rem;
   }
 
+  .chart-empty[hidden] {
+    display: none;
+  }
+
   .actions {
     display: grid;
     gap: 12px;
@@ -250,7 +254,7 @@
       <div class="panel-head">
         <div>
           <h2 class="panel-title">Datos históricos</h2>
-          <p class="panel-copy">Complete session history. Eje X: tiempo. Eje Y: rpm.</p>
+          <p class="panel-copy">(Eje X: tiempo. Eje Y: rpm.)</p>
         </div>
         <span class="status-pill" id="chart-status">Esperando inicio...</span>
       </div>
@@ -280,8 +284,8 @@
     var fileSelect = document.getElementById('file-select');
     var canvas = document.getElementById('history-chart');
     var context = canvas.getContext('2d');
-    var CURRENT_POLL_MS = 2000;
-    var HISTORY_POLL_MS = 10000;
+    var CURRENT_POLL_MS = 1000;
+    var HISTORY_POLL_MS = 1000;
     var FILES_POLL_MS = 15000;
 
     var lastHistoryPoints = [];
@@ -570,11 +574,20 @@
       });
     }
 
+    var historyRequestInFlight = false;
+
     function pollHistory() {
+      if (historyRequestInFlight) {
+        return;
+      }
+      historyRequestInFlight = true;
+
       var params = fileSelect.value ? ('?file=' + encodeURIComponent(fileSelect.value)) : '';
       getJSON('/api/history' + params, function (history) {
+        historyRequestInFlight = false;
         drawChart(history.points || []);
       }, function () {
+        historyRequestInFlight = false;
         chartStatus.textContent = 'Connection lost';
         setHidden(chartEmpty, false);
         chartEmpty.textContent = 'Connection lost. Reconnect to reload history.';

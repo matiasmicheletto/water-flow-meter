@@ -76,19 +76,6 @@ class FlowSimulator:
             }
         )
 
-        self._minute_window_count += 1
-        self._minute_pulse_sum += pulse_count_10s
-
-        if self._minute_window_count == 6:
-            self._minute_points.append(
-                {
-                    "t_ms": elapsed_ms,
-                    "pulses_per_minute": self._minute_pulse_sum,
-                }
-            )
-            self._minute_window_count = 0
-            self._minute_pulse_sum = 0
-
     def advance_to_now(self) -> None:
         with self._lock:
             elapsed_ms = self._elapsed_ms_now()
@@ -98,7 +85,7 @@ class FlowSimulator:
                 self._last_window_index += 1
                 self._append_measurement_window(self._last_window_index)
 
-    def snapshot_current(self) -> Dict[str, int | bool]:
+    def snapshot_current(self) -> Dict[str, int | bool | str]:
         self.advance_to_now()
         with self._lock:
             return {
@@ -112,23 +99,20 @@ class FlowSimulator:
                 "current_file": CURRENT_LOG_FILE,
             }
 
-    def snapshot_history(self) -> Dict[str, object]:
+    def snapshot_history(self) -> dict:
         self.advance_to_now()
         with self._lock:
-            payload: Dict[str, object] = {
-                "interval_ms": HISTORY_INTERVAL_MS,
+            payload: dict = {
+                "interval_ms": MEASUREMENT_INTERVAL_MS,
                 "measurement_interval_ms": MEASUREMENT_INTERVAL_MS,
-                "points": list(self._minute_points),
+                "points": [
+                    {
+                        "t_ms": r["t_ms"],
+                        "pulses_per_minute": r["pulses_per_minute"]
+                    }
+                    for r in self._records_10s
+                ],
             }
-
-            if self._minute_window_count > 0:
-                minute_index = self._last_window_index // 6
-                payload["partial_minute"] = {
-                    "t_ms": (minute_index + 1) * HISTORY_INTERVAL_MS,
-                    "samples": self._minute_window_count,
-                    "pulse_count_sum": self._minute_pulse_sum,
-                }
-
             return payload
 
     def export_csv(self) -> str:
@@ -149,17 +133,17 @@ app = FastAPI(title="Water Flow Meter Simulator")
 
 
 @app.get("/api/current")
-def api_current() -> Dict[str, int | bool]:
+def api_current() -> Dict[str, int | bool | str]:
     return sim.snapshot_current()
 
 
 @app.get("/api/history")
-def api_history(file: Optional[str] = None) -> Dict[str, object]:
+def api_history(file: Optional[str] = None) -> dict:
     return sim.snapshot_history()
 
 
 @app.get("/api/files")
-def api_files() -> Dict[str, object]:
+def api_files() -> dict:
     return {
         "files": [{"name": CURRENT_LOG_FILE, "current": True}],
         "current": CURRENT_LOG_FILE,

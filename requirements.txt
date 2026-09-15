@@ -15,7 +15,6 @@ pyelftools==0.33
 pyserial==3.5
 requests==2.34.2
 semantic-version==2.10.0
-starlette==0.52.1
 tabulate==0.10.0
 urllib3==2.7.0
 uvicorn==0.40.0

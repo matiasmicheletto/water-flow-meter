@@ -27,10 +27,24 @@
 // (D1/D2/D3 normally used by camera - we skip them by using 1-bit mode)
 
 // ---------- Timing ---------------------------------------------------------
-static const uint32_t MEASUREMENT_INTERVAL_MS = 10000; // 10-second windows
-static const uint32_t HISTORY_INTERVAL_MS = 60000;     // 1 point per minute
-static const uint32_t FLUSH_INTERVAL_MS = 10000;       // persist every 10-second window
-static const size_t BUFFER_CAPACITY = 24;              // >4 minutes of 10s records
+static const uint32_t MEASUREMENT_INTERVAL_MS = 1000;  // 1-second windows: raw sensor sampling rate
+static const uint32_t HISTORY_INTERVAL_MS = 1000;      // 1 point per second: matches the sample rate so
+                                                         // the chart and the current-reading card always
+                                                         // show the exact same value at the exact same time
+static const uint32_t FLUSH_INTERVAL_MS = 10000;       // persist every 10 seconds of samples
+static const size_t BUFFER_CAPACITY = 24;               // ~24 seconds of 1s records (see FLUSH_INTERVAL_MS)
+
+// These are derived from the two intervals above rather than hardcoded, so
+// changing either interval can't silently desync the rpm card, the chart,
+// and the CSV export from each other again. HISTORY_INTERVAL_MS must be an
+// integer multiple of MEASUREMENT_INTERVAL_MS for the bucketing math below
+// to line up; this is checked (and logged) once at boot in setup().
+static const uint32_t PULSES_PER_MINUTE_SCALE = 60000 / MEASUREMENT_INTERVAL_MS;  // scales one raw
+                                                                                    // sample's pulses to pulses/min
+static const uint32_t SAMPLES_PER_HISTORY_POINT = HISTORY_INTERVAL_MS / MEASUREMENT_INTERVAL_MS; // raw
+                                                                                    // samples folded into one chart point
+static const uint32_t HISTORY_POINT_SCALE = 60000 / HISTORY_INTERVAL_MS;          // scales a finalized
+                                                                                    // bucket's pulse sum to pulses/min
 
 // ---------- AP credentials ---------------------------------------------
 static const char* AP_SSID = "FlowMeter";
@@ -69,6 +83,11 @@ SemaphoreHandle_t sdMutex;
 // (sampling/flush) and the AsyncTCP task (history/export handlers).
 SemaphoreHandle_t bufferMutex;
 
+// Guards the incrementally-built minute history (minuteHistory + the live
+// in-progress minute accumulator) shared between loop() (sampleFlow) and
+// the AsyncTCP task (the /api/history handler's current-session fast path).
+SemaphoreHandle_t historyMutex;
+
 // ---------- Record buffer ---------------------------------------------
 struct FlowRecord {
   uint32_t t_ms;             // elapsed since boot, recorded at end of 10s window
@@ -79,6 +98,23 @@ struct FlowRecord {
 
 FlowRecord buffer[BUFFER_CAPACITY];
 size_t bufferLen = 0;
+
+// ---------- Incremental minute history (current session only) -----------
+// Built up one finalized minute at a time as sampleFlow() runs, so
+// /api/history can serve the current session without re-reading and
+// re-parsing the whole SD log file on every poll. Historical files
+// (requested via ?file=) still use the full-replay path since they're
+// viewed rarely, not polled continuously.
+struct MinutePoint {
+  uint32_t t_ms;
+  uint32_t pulses_per_minute;
+};
+std::vector<MinutePoint> minuteHistory;
+
+bool minuteAccActive = false;
+uint32_t minuteAccIndex = 0;
+uint32_t minuteAccPulseSum = 0;
+uint32_t minuteAccSampleCount = 0;
 
 uint32_t totalPulses = 0;
 uint32_t latestPulseCount10s = 0;
@@ -268,7 +304,7 @@ void sampleFlow(uint32_t measurementElapsedMs) {
   pulseCount = 0;
   interrupts();
 
-  uint32_t pulsesPerMinute = pulses * 6;
+  uint32_t pulsesPerMinute = pulses * PULSES_PER_MINUTE_SCALE;
 
   totalPulses += pulses;
   latestPulseCount10s = pulses;
@@ -298,6 +334,29 @@ void sampleFlow(uint32_t measurementElapsedMs) {
     }
     xSemaphoreGive(bufferMutex);
   }
+
+  // Fold this sample into the current history bucket, finalizing it the
+  // moment enough samples have accumulated (rather than waiting for the
+  // next sample to prove the bucket is over) so the chart's newest point
+  // shows up in the same tick as the rpm card, not a bucket later.
+  xSemaphoreTake(historyMutex, portMAX_DELAY);
+  if (!minuteAccActive) {
+    minuteAccActive = true;
+    minuteAccIndex = (measurementElapsedMs - 1) / HISTORY_INTERVAL_MS;
+  }
+  minuteAccPulseSum += pulses;
+  minuteAccSampleCount++;
+
+  if (minuteAccSampleCount >= SAMPLES_PER_HISTORY_POINT) {
+    MinutePoint point;
+    point.t_ms = (minuteAccIndex + 1) * HISTORY_INTERVAL_MS;
+    point.pulses_per_minute = minuteAccPulseSum * HISTORY_POINT_SCALE;
+    minuteHistory.push_back(point);
+    minuteAccActive = false;
+    minuteAccPulseSum = 0;
+    minuteAccSampleCount = 0;
+  }
+  xSemaphoreGive(historyMutex);
 }
 
 // ---------- Web server routes --------------------------------------------
@@ -336,16 +395,58 @@ void setupServer() {
   });
 
   server.on("/api/history", HTTP_GET, [](AsyncWebServerRequest *request) {
+    bool wantsCurrent = !request->hasParam("file");
     String requestedFile = LOG_PATH;
-    if (request->hasParam("file")) {
+    if (!wantsCurrent) {
       requestedFile = request->getParam("file")->value();
       if (!isValidLogFile(requestedFile)) {
         request->send(400, "text/plain", "Invalid log file");
         return;
       }
     }
-    bool isCurrentFile = (requestedFile == LOG_PATH);
+    bool isCurrentFile = wantsCurrent || (requestedFile == LOG_PATH);
 
+    // Fast path: the current session's history is already finalized
+    // incrementally in RAM by sampleFlow(), so this is O(points), not
+    // O(entire log file), and needs no SD access at all. This is what
+    // keeps continuous 1-second polling from bogging down as a session
+    // runs for a long time.
+    if (isCurrentFile) {
+      AsyncResponseStream *response = request->beginResponseStream("application/json");
+      response->print("{\"interval_ms\":");
+      response->print(HISTORY_INTERVAL_MS);
+      response->print(",\"measurement_interval_ms\":");
+      response->print(MEASUREMENT_INTERVAL_MS);
+      response->print(",\"points\":[");
+
+      xSemaphoreTake(historyMutex, portMAX_DELAY);
+      bool firstPoint = true;
+      for (const MinutePoint &point : minuteHistory) {
+        if (!firstPoint) {
+          response->print(',');
+        }
+        response->printf("{\"t_ms\":%lu,\"pulses_per_minute\":%lu}",
+                         static_cast<unsigned long>(point.t_ms),
+                         static_cast<unsigned long>(point.pulses_per_minute));
+        firstPoint = false;
+      }
+      response->print(']');
+      if (minuteAccActive && minuteAccSampleCount > 0 && minuteAccSampleCount < 6) {
+        response->printf(",\"partial_minute\":{\"t_ms\":%lu,\"samples\":%lu,\"pulse_count_sum\":%lu}",
+                         static_cast<unsigned long>((minuteAccIndex + 1) * HISTORY_INTERVAL_MS),
+                         static_cast<unsigned long>(minuteAccSampleCount),
+                         static_cast<unsigned long>(minuteAccPulseSum));
+      }
+      xSemaphoreGive(historyMutex);
+
+      response->print('}');
+      request->send(response);
+      return;
+    }
+
+    // Historical-file path: viewing an old session is a rare, one-off
+    // action (not continuously polled), so replaying the whole file here
+    // is fine.
     AsyncResponseStream *response = request->beginResponseStream("application/json");
     response->print("{\"interval_ms\":");
     response->print(HISTORY_INTERVAL_MS);
@@ -379,8 +480,8 @@ void setupServer() {
         return;
       }
 
-      if (minuteSampleCount >= 6) {
-        emitMinute(minuteIndex, minutePulseSum);
+      if (minuteSampleCount >= SAMPLES_PER_HISTORY_POINT) {
+        emitMinute(minuteIndex, minutePulseSum * HISTORY_POINT_SCALE);
       } else if (minuteSampleCount > 0) {
         hasPartialMinute = true;
         partialMinuteElapsedMs = (minuteIndex + 1) * HISTORY_INTERVAL_MS;
@@ -433,19 +534,9 @@ void setupServer() {
     }
     xSemaphoreGive(sdMutex);
 
-    if (isCurrentFile) {
-      FlowRecord snapshot[BUFFER_CAPACITY];
-      size_t snapshotLen;
-      xSemaphoreTake(bufferMutex, portMAX_DELAY);
-      snapshotLen = bufferLen;
-      memcpy(snapshot, buffer, sizeof(FlowRecord) * snapshotLen);
-      xSemaphoreGive(bufferMutex);
-
-      for (size_t i = 0; i < snapshotLen; i++) {
-        consumeRecord(snapshot[i]);
-      }
-    }
-
+    // This path only ever runs for an explicitly requested historical
+    // file (the current session returns earlier via the fast path above),
+    // so there's no live RAM buffer to merge in here — it's all on SD.
     finalizeMinute();
 
     response->print(']');
@@ -490,13 +581,19 @@ void setupServer() {
     }
     bool isCurrentFile = (requestedFile == LOG_PATH);
 
-    if (!sdReady) {
+    // Historical files only ever exist on SD, so those still require it.
+    // The current session, however, is also held in the RAM buffer, so it
+    // can still be exported even if SD never mounted or failed mid-run.
+    if (!sdReady && !isCurrentFile) {
       request->send(503, "text/plain", "SD card not available");
       return;
     }
 
     String fileName = requestedFile;
     fileName.replace("/", "");
+    if (fileName.isEmpty()) {
+      fileName = "flow_log_current.csv";
+    }
 
     AsyncResponseStream *response = request->beginResponseStream("text/csv");
     response->addHeader("Content-Disposition", "attachment; filename=" + fileName);
@@ -571,8 +668,16 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
+  if (60000 % MEASUREMENT_INTERVAL_MS != 0) {
+    Serial.println("[CONFIG] WARNING: 60000 is not evenly divisible by MEASUREMENT_INTERVAL_MS - pulses_per_minute will be slightly off");
+  }
+  if (HISTORY_INTERVAL_MS % MEASUREMENT_INTERVAL_MS != 0 || SAMPLES_PER_HISTORY_POINT == 0) {
+    Serial.println("[CONFIG] WARNING: HISTORY_INTERVAL_MS must be a positive multiple of MEASUREMENT_INTERVAL_MS - history bucketing will be wrong");
+  }
+
   sdMutex = xSemaphoreCreateMutex();
   bufferMutex = xSemaphoreCreateMutex();
+  historyMutex = xSemaphoreCreateMutex();
 
   pinMode(FLOW_SENSOR_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), onPulse, RISING);

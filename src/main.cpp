@@ -46,6 +46,13 @@ static const uint32_t SAMPLES_PER_HISTORY_POINT = HISTORY_INTERVAL_MS / MEASUREM
 static const uint32_t HISTORY_POINT_SCALE = 60000 / HISTORY_INTERVAL_MS;          // scales a finalized
                                                                                     // bucket's pulse sum to pulses/min
 
+// The live in-RAM chart only needs a recent window, not the whole session
+// (which stays fully available on SD for export regardless). Bounding
+// minuteHistory to this many points keeps both its RAM footprint and the
+// /api/history response size constant no matter how long the device runs.
+static const uint32_t LIVE_WINDOW_MS = 10UL * 60UL * 1000UL; // 10 minutes
+static const size_t MAX_HISTORY_POINTS = LIVE_WINDOW_MS / HISTORY_INTERVAL_MS;
+
 // ---------- AP credentials ---------------------------------------------
 static const char* AP_SSID = "FlowMeter";
 static const char* AP_PASS = "flowmeter123"; // 8+ chars required by WiFi lib
@@ -352,6 +359,13 @@ void sampleFlow(uint32_t measurementElapsedMs) {
     point.t_ms = (minuteAccIndex + 1) * HISTORY_INTERVAL_MS;
     point.pulses_per_minute = minuteAccPulseSum * HISTORY_POINT_SCALE;
     minuteHistory.push_back(point);
+    // Bounded to a rolling window (~600 points at 1/sec for 10 minutes) -
+    // one erase-from-front per second is negligible work on this hardware,
+    // and it's far simpler than a manual circular-buffer index for a
+    // vector this small.
+    if (minuteHistory.size() > MAX_HISTORY_POINTS) {
+      minuteHistory.erase(minuteHistory.begin());
+    }
     minuteAccActive = false;
     minuteAccPulseSum = 0;
     minuteAccSampleCount = 0;

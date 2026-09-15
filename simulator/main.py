@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-MEASUREMENT_INTERVAL_MS = 10_000
+MEASUREMENT_INTERVAL_MS = 1_000
 HISTORY_INTERVAL_MS = 60_000
 # The real firmware creates a new log file per boot; the simulator only runs
 # a single session, so it exposes one fixed file name for API-contract parity.

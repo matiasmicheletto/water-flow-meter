@@ -254,7 +254,7 @@
       <div class="panel-head">
         <div>
           <h2 class="panel-title">Datos históricos</h2>
-          <p class="panel-copy">(Eje X: tiempo. Eje Y: rpm.)</p>
+          <p class="panel-copy">Últimos 10 minutos</p>
         </div>
         <span class="status-pill" id="chart-status">Esperando inicio...</span>
       </div>
@@ -287,6 +287,7 @@
     var CURRENT_POLL_MS = 1000;
     var HISTORY_POLL_MS = 1000;
     var FILES_POLL_MS = 15000;
+    var CHART_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 
     var lastHistoryPoints = [];
     var lastCurrent = null;
@@ -576,7 +577,29 @@
 
     var historyRequestInFlight = false;
 
+    function windowPoints(points) {
+      var latestT;
+      var cutoff;
+      var i;
+
+      if (!points.length) {
+        return points;
+      }
+
+      latestT = points[points.length - 1].t_ms;
+      cutoff = latestT - CHART_WINDOW_MS;
+
+      for (i = 0; i < points.length; i += 1) {
+        if (points[i].t_ms >= cutoff) {
+          break;
+        }
+      }
+      return points.slice(i);
+    }
+
     function pollHistory() {
+      var isLiveSession = !fileSelect.value;
+
       if (historyRequestInFlight) {
         return;
       }
@@ -584,8 +607,13 @@
 
       var params = fileSelect.value ? ('?file=' + encodeURIComponent(fileSelect.value)) : '';
       getJSON('/api/history' + params, function (history) {
+        var points = history.points || [];
         historyRequestInFlight = false;
-        drawChart(history.points || []);
+        // The live session is already bounded to ~10 minutes on the device,
+        // but trim client-side too as a defensive backstop. A selected
+        // historical file is shown in full, since browsing an old session
+        // is a deliberate look-back, not a live-monitoring view.
+        drawChart(isLiveSession ? windowPoints(points) : points);
       }, function () {
         historyRequestInFlight = false;
         chartStatus.textContent = 'Connection lost';

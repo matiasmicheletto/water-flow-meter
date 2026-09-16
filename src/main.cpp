@@ -8,6 +8,22 @@
  * - AP mode serves a LittleFS-hosted dashboard + JSON/CSV APIs
  *
  * Camera is NOT initialized -> its pins are free for SD_MMC + sensor.
+ *
+ * --- async_tcp watchdog notes (read this before touching handlers) -------
+ * Every server.on(...) lambda runs inside the "async_tcp" FreeRTOS task,
+ * which is subscribed to the 5s task watchdog. Two rules follow from that,
+ * and every handler below is written to respect them:
+ *
+ *   1. Never take a mutex with portMAX_DELAY from a handler. Always use a
+ *      short pdMS_TO_TICKS() timeout and fail the request (503) if it
+ *      expires. loop()-side code (sampleFlow, flushBufferToSD) is NOT in
+ *      the watchdogged task, so it's fine for it to wait longer for the
+ *      same locks.
+ *   2. Never do unbounded work (reading a whole file into RAM, serializing
+ *      under a lock that's also needed every second by loop()) inside a
+ *      handler. Snapshot shared state under a short lock, release it, then
+ *      do the slow part outside the lock; stream large payloads in bounded
+ *      chunks instead of buffering them whole.
  */
 
 #include <Arduino.h>
@@ -19,6 +35,8 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include <vector>
+#include <set>
+#include <memory>
 #include <algorithm>
 
 // ---------- Pin assignments (AI-Thinker ESP32-CAM, camera disabled) ------
@@ -33,6 +51,9 @@ static const uint32_t HISTORY_INTERVAL_MS = 1000;      // 1 point per second: ma
                                                          // show the exact same value at the exact same time
 static const uint32_t FLUSH_INTERVAL_MS = 10000;       // persist every 10 seconds of samples
 static const size_t BUFFER_CAPACITY = 24;               // ~24 seconds of 1s records (see FLUSH_INTERVAL_MS)
+
+static const uint32_t HEAP_LOG_INTERVAL_MS = 30000;    // log heap status every 30 seconds
+static uint32_t lastHeapLogMs = 0;
 
 // These are derived from the two intervals above rather than hardcoded, so
 // changing either interval can't silently desync the rpm card, the chart,
@@ -52,6 +73,11 @@ static const uint32_t HISTORY_POINT_SCALE = 60000 / HISTORY_INTERVAL_MS;        
 // /api/history response size constant no matter how long the device runs.
 static const uint32_t LIVE_WINDOW_MS = 10UL * 60UL * 1000UL; // 10 minutes
 static const size_t MAX_HISTORY_POINTS = LIVE_WINDOW_MS / HISTORY_INTERVAL_MS;
+
+// ---------- Mutex wait budgets ---------------------------------------------
+// Handler-side waits (async_tcp task): short and bounded, see file header.
+static const TickType_t HANDLER_LOCK_TIMEOUT = pdMS_TO_TICKS(100);
+static const TickType_t HANDLER_SD_TIMEOUT   = pdMS_TO_TICKS(300);
 
 // ---------- AP credentials ---------------------------------------------
 static const char* AP_SSID = "FlowMeter";
@@ -138,6 +164,10 @@ bool sdReady = false;
 String LOG_PATH;
 const char* BOOT_SEQ_PATH = "/boot_seq.txt";
 
+// Real files present on LittleFS at boot, used to keep the static handler
+// from swallowing every unmatched path (see buildAssetIndex()/setupServer()).
+std::set<String> knownAssets;
+
 AsyncWebServer server(80);
 
 bool parseFlowRecordLine(const String &line, FlowRecord &record) {
@@ -211,8 +241,15 @@ String allocateLogPath() {
   return String(path);
 }
 
+// setup()-only: runs once before the server or loop() ever touch SD, so a
+// generous wait here is fine - there's no contention yet and nothing is
+// watchdogged at this point.
 void ensureLogHeader() {
-  xSemaphoreTake(sdMutex, portMAX_DELAY);
+  if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    Serial.println("[SD] log header skipped, sdMutex busy");
+    WebSerial.println("[SD] log header skipped, sdMutex busy");
+    return;
+  }
   if (!SD_MMC.exists(LOG_PATH)) {
     File f = SD_MMC.open(LOG_PATH, FILE_WRITE);
     if (f) {
@@ -224,18 +261,25 @@ void ensureLogHeader() {
 }
 
 // Creates a brand-new log file for this boot session, so past runs are
-// preserved as separate files instead of being appended to.
+// preserved as separate files instead of being appended to. setup()-only,
+// same reasoning as ensureLogHeader() above.
 void initLogFile() {
-  xSemaphoreTake(sdMutex, portMAX_DELAY);
+  if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    Serial.println("[SD] log init skipped, sdMutex busy");
+    WebSerial.println("[SD] log init skipped, sdMutex busy");
+    return;
+  }
   LOG_PATH = allocateLogPath();
   xSemaphoreGive(sdMutex);
   ensureLogHeader();
 }
 
-// Lists log files on SD (newest first), for the export file picker.
-std::vector<String> listLogFiles() {
-  std::vector<String> names;
-  xSemaphoreTake(sdMutex, portMAX_DELAY);
+// Lists log files on SD (newest first), for the export file picker. Called
+// from the /api/files handler, i.e. from the async_tcp task - bounded wait.
+bool listLogFiles(std::vector<String> &names) {
+  if (xSemaphoreTake(sdMutex, HANDLER_SD_TIMEOUT) != pdTRUE) {
+    return false;
+  }
   File root = SD_MMC.open("/");
   if (root) {
     File entry = root.openNextFile();
@@ -254,9 +298,12 @@ std::vector<String> listLogFiles() {
   xSemaphoreGive(sdMutex);
 
   std::sort(names.begin(), names.end(), std::greater<String>());
-  return names;
+  return true;
 }
 
+// loop()-only (not the watchdogged async_tcp task), so waiting for the
+// locks here can afford to be generous - the readers on the handler side
+// now hold them only briefly, so contention windows are short anyway.
 void flushBufferToSD() {
   if (!sdReady) return;
 
@@ -273,7 +320,11 @@ void flushBufferToSD() {
 
   if (snapshotLen == 0) return;
 
-  xSemaphoreTake(sdMutex, portMAX_DELAY);
+  if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    Serial.println("[SD] flush skipped, sdMutex busy");
+    WebSerial.println("[SD] flush skipped, sdMutex busy");
+    return;
+  }
   File f = SD_MMC.open(LOG_PATH, FILE_APPEND);
   if (!f) {
     xSemaphoreGive(sdMutex);
@@ -304,7 +355,7 @@ void flushBufferToSD() {
   WebSerial.printf("[SD] flushed %u records\n", (unsigned)snapshotLen);
 }
 
-// ---------- Sensor sampling ---------------------------------------------
+// ---------- Sensor sampling (loop()-only) --------------------------------
 void sampleFlow(uint32_t measurementElapsedMs) {
   noInterrupts();
   uint32_t pulses = pulseCount;
@@ -373,6 +424,49 @@ void sampleFlow(uint32_t measurementElapsedMs) {
   xSemaphoreGive(historyMutex);
 }
 
+// ---------- Static-asset filtering -----------------------------------------
+// Walks LittleFS once at boot and records every real file. serveStatic()'s
+// filter then only matches requests against this set (plus "/"), instead of
+// matching every non-/api/ path. Without this, serveStatic's broad filter
+// claims requests like /generate_204 or /favicon.ico before they ever reach
+// the captive-portal redirect in onNotFound() - each one then falls through
+// AsyncStaticWebHandler's internal "try .gz, then plain, then index.html"
+// fallback, doing several synchronous flash reads per bogus request, all
+// inside the watchdogged async_tcp task. A burst of these around Wi-Fi
+// association is exactly what was tripping the task watchdog.
+void buildAssetIndex() {
+  File root = LittleFS.open("/");
+  if (!root) return;
+  File f = root.openNextFile();
+  while (f) {
+    if (!f.isDirectory()) {
+      String name = String(f.name());
+      if (!name.startsWith("/")) {
+        name = "/" + name;
+      }
+      knownAssets.insert(name);
+    }
+    f = root.openNextFile();
+  }
+  root.close();
+  Serial.printf("[LittleFS] indexed %u asset(s)\n", (unsigned)knownAssets.size());
+}
+
+// ---------- CSV export state (async_tcp task, streamed) -------------------
+// Carried by shared_ptr into the chunked-response callback so it lives
+// exactly as long as the response does and is freed automatically when it
+// finishes - no manual cleanup path to get wrong on the error branches.
+struct ExportState {
+  File file;
+  bool fileOpen = false;
+  bool headerPending = false;
+  bool includeBuffer = false;
+  bool bufferDone = false;
+  FlowRecord bufSnapshot[BUFFER_CAPACITY];
+  size_t bufLen = 0;
+  size_t bufIndex = 0;
+};
+
 // ---------- Web server routes --------------------------------------------
 void setupServer() {
   WebSerial.begin(&server);
@@ -380,6 +474,8 @@ void setupServer() {
   if (!LittleFS.begin(true)) {
     Serial.println("[LittleFS] mount failed");
     WebSerial.println("[LittleFS] mount failed");
+  } else {
+    buildAssetIndex();
   }
 
   // WebSerial: bi-directional console over WebSocket, for debugging
@@ -387,9 +483,6 @@ void setupServer() {
   WebSerial.onMessage([](uint8_t *data, size_t len) {
     // Handle incoming commands if necessary
   }); */
-  // Serve the frontend from LittleFS (data/index.html -> uploaded via
-  // `pio run --target uploadfs`), fully decoupled from firmware logic.
-  server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
 
   // Current reading based on the latest completed 10-second measurement.
   server.on("/api/current", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -425,7 +518,27 @@ void setupServer() {
     // O(entire log file), and needs no SD access at all. This is what
     // keeps continuous 1-second polling from bogging down as a session
     // runs for a long time.
+    //
+    // The lock is held only long enough to copy the (small, bounded)
+    // vector and the accumulator fields - all serialization happens after
+    // it's released, so a slow/backed-up TCP send here can never delay
+    // sampleFlow()'s once-a-second write to the same data.
     if (isCurrentFile) {
+      std::vector<MinutePoint> historySnapshot;
+      bool haveActive = false;
+      uint32_t activeIndex = 0, activeSum = 0, activeCount = 0;
+
+      if (xSemaphoreTake(historyMutex, HANDLER_LOCK_TIMEOUT) != pdTRUE) {
+        request->send(503, "text/plain", "Busy, try again");
+        return;
+      }
+      historySnapshot = minuteHistory;
+      haveActive = minuteAccActive;
+      activeIndex = minuteAccIndex;
+      activeSum = minuteAccPulseSum;
+      activeCount = minuteAccSampleCount;
+      xSemaphoreGive(historyMutex);
+
       AsyncResponseStream *response = request->beginResponseStream("application/json");
       response->print("{\"interval_ms\":");
       response->print(HISTORY_INTERVAL_MS);
@@ -433,9 +546,8 @@ void setupServer() {
       response->print(MEASUREMENT_INTERVAL_MS);
       response->print(",\"points\":[");
 
-      xSemaphoreTake(historyMutex, portMAX_DELAY);
       bool firstPoint = true;
-      for (const MinutePoint &point : minuteHistory) {
+      for (const MinutePoint &point : historySnapshot) {
         if (!firstPoint) {
           response->print(',');
         }
@@ -445,14 +557,12 @@ void setupServer() {
         firstPoint = false;
       }
       response->print(']');
-      if (minuteAccActive && minuteAccSampleCount > 0 && minuteAccSampleCount < 6) {
+      if (haveActive && activeCount > 0 && activeCount < SAMPLES_PER_HISTORY_POINT) {
         response->printf(",\"partial_minute\":{\"t_ms\":%lu,\"samples\":%lu,\"pulse_count_sum\":%lu}",
-                         static_cast<unsigned long>((minuteAccIndex + 1) * HISTORY_INTERVAL_MS),
-                         static_cast<unsigned long>(minuteAccSampleCount),
-                         static_cast<unsigned long>(minuteAccPulseSum));
+                         static_cast<unsigned long>((activeIndex + 1) * HISTORY_INTERVAL_MS),
+                         static_cast<unsigned long>(activeCount),
+                         static_cast<unsigned long>(activeSum));
       }
-      xSemaphoreGive(historyMutex);
-
       response->print('}');
       request->send(response);
       return;
@@ -527,7 +637,10 @@ void setupServer() {
       minuteSampleCount++;
     };
 
-    xSemaphoreTake(sdMutex, portMAX_DELAY);
+    if (xSemaphoreTake(sdMutex, HANDLER_SD_TIMEOUT) != pdTRUE) {
+      request->send(503, "text/plain", "SD busy, try again");
+      return;
+    }
     if (sdReady && SD_MMC.exists(requestedFile)) {
       File f = SD_MMC.open(requestedFile, FILE_READ);
       if (f) {
@@ -550,7 +663,7 @@ void setupServer() {
 
     // This path only ever runs for an explicitly requested historical
     // file (the current session returns earlier via the fast path above),
-    // so there's no live RAM buffer to merge in here — it's all on SD.
+    // so there's no live RAM buffer to merge in here - it's all on SD.
     finalizeMinute();
 
     response->print(']');
@@ -571,7 +684,12 @@ void setupServer() {
     JsonArray files = doc["files"].to<JsonArray>();
 
     if (sdReady) {
-      for (const String &name : listLogFiles()) {
+      std::vector<String> logFiles;
+      if (!listLogFiles(logFiles)) {
+        request->send(503, "text/plain", "SD busy, try again");
+        return;
+      }
+      for (const String &name : logFiles) {
         JsonObject entry = files.add<JsonObject>();
         entry["name"] = name;
         entry["current"] = (name == LOG_PATH);
@@ -584,6 +702,14 @@ void setupServer() {
     request->send(200, "application/json", out);
   });
 
+  // Streams the CSV instead of buffering it in RAM: for a historical file
+  // this is a near-verbatim byte copy straight from SD (no per-line String
+  // allocation, no quadratic response-buffer growth); for the current
+  // session it copies from SD the same way and then appends the small
+  // (<= BUFFER_CAPACITY records) unflushed tail from RAM. Locks are taken
+  // AFTER the response object would otherwise be created, and released
+  // well before the (potentially large) SD copy runs, so a busy-503 here
+  // never leaks a response object the way the old buffered version could.
   server.on("/api/export.csv", HTTP_GET, [](AsyncWebServerRequest *request) {
     String requestedFile = LOG_PATH;
     if (request->hasParam("file")) {
@@ -603,75 +729,135 @@ void setupServer() {
       return;
     }
 
+    auto state = std::make_shared<ExportState>();
+
+    if (sdReady) {
+      if (xSemaphoreTake(sdMutex, HANDLER_SD_TIMEOUT) != pdTRUE) {
+        request->send(503, "text/plain", "SD busy, try again");
+        return;
+      }
+      if (SD_MMC.exists(requestedFile)) {
+        state->file = SD_MMC.open(requestedFile, FILE_READ);
+        state->fileOpen = (bool)state->file;
+      }
+      xSemaphoreGive(sdMutex);
+    }
+    // If we couldn't open the file (missing, or SD unavailable), the SD
+    // side of the response is skipped and this handler writes the header
+    // itself so the output is still a well-formed CSV.
+    state->headerPending = !state->fileOpen;
+
+    if (isCurrentFile) {
+      if (xSemaphoreTake(bufferMutex, HANDLER_LOCK_TIMEOUT) != pdTRUE) {
+        if (state->fileOpen) state->file.close();
+        request->send(503, "text/plain", "Buffer busy, try again");
+        return;
+      }
+      state->bufLen = bufferLen;
+      memcpy(state->bufSnapshot, buffer, sizeof(FlowRecord) * bufferLen);
+      xSemaphoreGive(bufferMutex);
+      state->includeBuffer = true;
+    }
+
     String fileName = requestedFile;
     fileName.replace("/", "");
     if (fileName.isEmpty()) {
       fileName = "flow_log_current.csv";
     }
 
-    AsyncResponseStream *response = request->beginResponseStream("text/csv");
-    response->addHeader("Content-Disposition", "attachment; filename=" + fileName);
-    response->print("t_ms,pulse_count_10s,pulses_per_minute,total_pulses\n");
+    AsyncWebServerResponse *response = request->beginChunkedResponse(
+      "text/csv",
+      [state](uint8_t *buf, size_t maxLen, size_t /*index*/) -> size_t {
+        size_t written = 0;
 
-    xSemaphoreTake(sdMutex, portMAX_DELAY);
-    if (sdReady && SD_MMC.exists(requestedFile)) {
-      File f = SD_MMC.open(requestedFile, FILE_READ);
-      if (f) {
-        while (f.available()) {
-          String line = f.readStringUntil('\n');
-          line.trim();
-          if (line.isEmpty() || line.startsWith("t_ms,")) {
-            continue;
+        if (state->headerPending) {
+          static const char *HEADER = "t_ms,pulse_count_10s,pulses_per_minute,total_pulses\n";
+          size_t len = strlen(HEADER);
+          if (len > maxLen) {
+            return 0; // pathologically small chunk size; won't happen in practice
           }
-          response->println(line);
+          memcpy(buf, HEADER, len);
+          written = len;
+          state->headerPending = false;
         }
-        f.close();
-      }
-    }
-    xSemaphoreGive(sdMutex);
 
-    if (isCurrentFile) {
-      FlowRecord snapshot[BUFFER_CAPACITY];
-      size_t snapshotLen;
-      xSemaphoreTake(bufferMutex, portMAX_DELAY);
-      snapshotLen = bufferLen;
-      memcpy(snapshot, buffer, sizeof(FlowRecord) * snapshotLen);
-      xSemaphoreGive(bufferMutex);
+        // Raw byte copy straight from the file - it's already valid CSV
+        // (including its own header, which is why we only add one above
+        // when there was no file to read one from), so there's no need to
+        // parse lines here the way the old handler did.
+        if (state->fileOpen && written < maxLen) {
+          int n = state->file.read(buf + written, maxLen - written);
+          if (n > 0) {
+            written += (size_t)n;
+          } else {
+            state->file.close();
+            state->fileOpen = false;
+          }
+        }
 
-      for (size_t i = 0; i < snapshotLen; i++) {
-        response->printf("%lu,%lu,%lu,%lu\n",
-                         snapshot[i].t_ms,
-                         snapshot[i].pulse_count_10s,
-                         snapshot[i].pulses_per_minute,
-                         snapshot[i].total_pulses);
-      }
-    }
+        // Small (<= BUFFER_CAPACITY records), always fits in the
+        // remainder of a chunk; if it somehow doesn't, the unwritten
+        // records are simply retried on the next callback invocation.
+        if (written < maxLen && state->includeBuffer && !state->bufferDone) {
+          while (state->bufIndex < state->bufLen) {
+            char line[64];
+            int len = snprintf(line, sizeof(line), "%lu,%lu,%lu,%lu\n",
+                                (unsigned long)state->bufSnapshot[state->bufIndex].t_ms,
+                                (unsigned long)state->bufSnapshot[state->bufIndex].pulse_count_10s,
+                                (unsigned long)state->bufSnapshot[state->bufIndex].pulses_per_minute,
+                                (unsigned long)state->bufSnapshot[state->bufIndex].total_pulses);
+            if (len < 0) {
+              state->bufIndex++;
+              continue;
+            }
+            if (written + (size_t)len > maxLen) {
+              break; // retry this record on the next call
+            }
+            memcpy(buf + written, line, len);
+            written += (size_t)len;
+            state->bufIndex++;
+          }
+          if (state->bufIndex >= state->bufLen) {
+            state->bufferDone = true;
+          }
+        }
 
+        return written; // 0 once every phase is exhausted -> ends the response
+      });
+
+    response->addHeader("Content-Disposition", "attachment; filename=" + fileName);
     request->send(response);
   });
 
-  // ---- Captive portal detection ----
-  // OS connectivity checks hit these fixed, well-known paths (any hostname,
-  // since DNS resolves everything to us). Redirecting them to "/" makes the
-  // OS recognize a captive portal and open it in a browser/portal webview.
-  auto redirectToApp = [](AsyncWebServerRequest *request) {
-    request->redirect("/");
-  };
-  server.on("/generate_204", HTTP_GET, redirectToApp);       // Android
-  server.on("/gen_204", HTTP_GET, redirectToApp);            // Android
-  server.on("/hotspot-detect.html", HTTP_GET, redirectToApp); // iOS/macOS
-  server.on("/connecttest.txt", HTTP_GET, redirectToApp);    // Windows
-  server.on("/ncsi.txt", HTTP_GET, redirectToApp);           // Windows
-  server.on("/success.txt", HTTP_GET, redirectToApp);        // ChromeOS/other
+  // Serve the frontend from LittleFS (data/index.html -> uploaded via
+  // `pio run --target uploadfs`), fully decoupled from firmware logic.
+  // Filtered against the boot-time asset index (see buildAssetIndex())
+  // rather than a blanket "not /api/" filter, so this handler only ever
+  // claims requests for files that actually exist. Everything else -
+  // captive-portal probes included - now correctly reaches onNotFound()
+  // below without touching the filesystem at all.
+  server.serveStatic("/", LittleFS, "/")
+  .setDefaultFile("index.html")
+  .setFilter([](AsyncWebServerRequest *r) {
+    if (r->url().startsWith("/api/")) return false;
+    if (r->url() == "/") return true;
+    return knownAssets.count(r->url()) > 0;
+  });
 
-  // Any other unmatched path falls back to the app so the portal still
-  // opens, except unknown /api/ routes which must surface as real 404s.
-  server.onNotFound([redirectToApp](AsyncWebServerRequest *request) {
+  // ---- Captive portal detection ----
+  // OS connectivity checks hit fixed, well-known paths (any hostname,
+  // since DNS resolves everything to us) that don't exist as real files,
+  // so with the asset-index filter above they all land here. Redirecting
+  // to "/" makes the OS recognize a captive portal and open it in a
+  // browser/portal webview. This one handler covers every OS's probe path
+  // (Android's /generate_204, iOS/macOS's /hotspot-detect.html, Windows'
+  // /ncsi.txt, and anything else) instead of needing one entry per OS.
+  server.onNotFound([](AsyncWebServerRequest *request) {
     if (request->url().startsWith("/api/")) {
       request->send(404, "application/json", "{\"error\":\"Not found\"}");
       return;
     }
-    redirectToApp(request);
+    request->redirect("/");
   });
 
   server.begin();
@@ -681,6 +867,8 @@ void setupServer() {
 void setup() {
   Serial.begin(115200);
   delay(200);
+
+  Serial.printf("[BOOT] reset reason: %d, free heap: %u\n",(int)esp_reset_reason(), ESP.getFreeHeap());
 
   if (60000 % MEASUREMENT_INTERVAL_MS != 0) {
     Serial.println("[CONFIG] WARNING: 60000 is not evenly divisible by MEASUREMENT_INTERVAL_MS - pulses_per_minute will be slightly off");
@@ -738,6 +926,12 @@ void loop() {
 
   uint32_t now = millis();
 
+  if (now - lastHeapLogMs >= HEAP_LOG_INTERVAL_MS) {
+    lastHeapLogMs = now;
+    Serial.printf("[HEAP] free=%u largest=%u minfree=%u\n",
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getMinFreeHeap());
+  }
+
   while ((uint32_t)(now - lastMeasurementMs) >= MEASUREMENT_INTERVAL_MS) {
     lastMeasurementMs += MEASUREMENT_INTERVAL_MS;
     sampleFlow(lastMeasurementMs);
@@ -747,4 +941,6 @@ void loop() {
     lastFlushMs = now;
     flushBufferToSD();
   }
+
+  delay(1);
 }

@@ -829,6 +829,24 @@ void setupServer() {
     request->send(response);
   });
 
+
+  // Captive portal detection endpoints for various OS connectivity checks.
+  server.on("/generate_204", HTTP_ANY, [](AsyncWebServerRequest *request) {
+    request->redirect("/");
+  });
+  server.on("/hotspot-detect.html", HTTP_ANY, [](AsyncWebServerRequest *request) {
+      request->redirect("/");
+  });
+  server.on("/ncsi.txt", HTTP_ANY, [](AsyncWebServerRequest *request) {
+      request->redirect("/");
+  });
+  server.on("/connecttest.txt", HTTP_ANY, [](AsyncWebServerRequest *request) {
+      request->redirect("/");
+  });
+  server.on("/redirect", HTTP_ANY, [](AsyncWebServerRequest *request) {
+      request->redirect("/");
+  });
+
   // Serve the frontend from LittleFS (data/index.html -> uploaded via
   // `pio run --target uploadfs`), fully decoupled from firmware logic.
   // Filtered against the boot-time asset index (see buildAssetIndex())
@@ -926,21 +944,23 @@ void loop() {
 
   uint32_t now = millis();
 
+  // Log heap status periodically.
   if (now - lastHeapLogMs >= HEAP_LOG_INTERVAL_MS) {
     lastHeapLogMs = now;
-    Serial.printf("[HEAP] free=%u largest=%u minfree=%u\n",
-                  ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getMinFreeHeap());
+    Serial.printf("[HEAP] free=%u largest=%u minfree=%u\n",ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getMinFreeHeap());
   }
 
+  // Perform any other periodic tasks here.
   while ((uint32_t)(now - lastMeasurementMs) >= MEASUREMENT_INTERVAL_MS) {
     lastMeasurementMs += MEASUREMENT_INTERVAL_MS;
     sampleFlow(lastMeasurementMs);
   }
 
+  // Flush any remaining data to the SD card periodically.
   if (now - lastFlushMs >= FLUSH_INTERVAL_MS) {
     lastFlushMs = now;
     flushBufferToSD();
   }
 
-  delay(1);
+  delay(1); // Short delay to yield to other tasks and avoid watchdog resets.
 }

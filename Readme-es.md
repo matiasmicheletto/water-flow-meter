@@ -10,11 +10,24 @@ El hardware utiliza un convertidor reductor DC-DC LM2596 para regular el voltaje
 
 ## Hardware
 
-- Placa: AI-Thinker ESP32-CAM
-- Sensor de flujo: YF-S401
-- Pin de pulso del sensor de flujo: GPIO13 (`FLOW_SENSOR_PIN`)
-- Almacenamiento: Tarjeta microSD a través de `SD_MMC` en modo de 1 bit
-- Almacenamiento del frontend: `LittleFS` (`data/index.html`)
+La señal de salida del YF-S401 se conecta a un divisor de voltaje formado por resistencias de 10 kΩ y 18 kΩ para reducir la tensión del sensor a un valor más cercano al rango lógico de 3.3 V requerido por la entrada del ESP32-CAM. La placa también incluye una pequeña red de estabilización de alimentación en la entrada principal de VCC: un capacitor electrolítico de 470 µF y un capacitor cerámico de 150 nF ubicados cerca de la entrada de la placa para absorber los picos de corriente generados por la radio Wi‑Fi y mantener la tensión estable durante los ráfagas de transmisión.
+
+| Componente | Precio estimado (ARS 2026) | 
+| --- | --- |
+| ESP32-CAM + MB USB CH340G | $25.000 |
+| Caudalimetro ef. hall | $8.000 |
+| Tira de cables dupont 40x30 | $7.000 |
+| Fuente DC-DC step down LM2596 | $5.000 |
+| Micro SD HC clase 4 | $5.000 |
+| Plaqueta perforada 70x90 | $5.000 |
+| Capacitor electrolitico 470uF | $400 |
+| Capacitor poliester 150nF | $2.000 |
+| Resistencia 10k 1/4 w | $300 |
+| Resistencia 18k 1/4 w | $300 |
+| Jack DC hembra 12V | $800 |
+| Jumper 2.54mm | $200 |
+| Tira de pines hembra 2.54mm | $1.500 |
+| **Total** | **$60,500** |
 
 <table>
     <tr>
@@ -23,14 +36,15 @@ El hardware utiliza un convertidor reductor DC-DC LM2596 para regular el voltaje
     </tr>
 </table> 
 
+Notas:
+
+- Pin de pulso del sensor de flujo: GPIO13 (`FLOW_SENSOR_PIN`)
+- Almacenamiento: Tarjeta microSD a través de `SD_MMC` en modo de 1 bit
+- Almacenamiento del frontend: `LittleFS` (`data/index.html`)
+
 ### Esquemático
 
 <img src="doc/schematic.jpg" alt="Esquematico del circuito">
-
-Notas:
-
-La señal de salida del YF-S401 se conecta a un divisor de voltaje formado por resistencias de 10 kΩ y 18 kΩ para reducir la tensión del sensor a un valor más cercano al rango lógico de 3.3 V requerido por la entrada del ESP32-CAM. La placa también incluye una pequeña red de estabilización de alimentación en la entrada principal de VCC: un capacitor electrolítico de 470 µF y un capacitor cerámico de 150 nF ubicados cerca de la entrada de la placa para absorber los picos de corriente generados por la radio Wi‑Fi y mantener la tensión estable durante los ráfagas de transmisión.
-
 
 ## Comportamiento actual del firmware
 
@@ -207,6 +221,12 @@ pio run --target uploadfs --upload-port /dev/ttyUSB0
 
 ```bash
 pio device monitor --port /dev/ttyUSB0 --baud 115200
+```
+
+5. Si se necesita registrar salidas en archivo usar:
+
+```bash
+pio device monitor --port /dev/ttyUSB0 --baud 115200 --rts 0 --dtr 0 --filter esp32_exception_decoder --filter time --filter log2file
 ```
 
 Si la carga falla, coloque el ESP32-CAM en modo de flasheo (IO0 a GND o mantenga presionado el botón IO0 según lo requiera su adaptador) y vuelva a intentarlo.

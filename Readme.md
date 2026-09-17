@@ -10,11 +10,24 @@ The hardware uses an LM2596 DC-DC buck converter to regulate the input supply to
 
 ## Hardware
 
-- Board: AI-Thinker ESP32-CAM
-- Flow sensor: YF-S401
-- Flow sensor pulse pin: GPIO13 (`FLOW_SENSOR_PIN`)
-- Storage: microSD card via `SD_MMC` in 1-bit mode
-- Frontend storage: `LittleFS` (`data/index.html`)
+The YF-S401 output signal is fed through a voltage divider built with 10 kΩ and 18 kΩ resistors to reduce the sensor signal to a level much closer to the 3.3 V logic range required by the ESP32-CAM input. The board also includes a small supply stabilization network on the main VCC rail: a 470 µF electrolytic capacitor and a 150 nF ceramic capacitor placed near the board input to absorb current spikes caused by the Wi-Fi radio and keep the voltage stable during transmission bursts.
+
+| Component | Price (ARS-USD converted) | Est. US Market Price (USD) |
+|---|---|---|
+| ESP32-CAM + CH340G USB shield | $16.03 | $10.00 |
+| Hall effect flow sensor (YF-S401) | $5.13 | $6.00 |
+| 40-pin Dupont wire ribbon (30cm) | $4.49 | $3.00 |
+| LM2596 DC-DC step-down power module | $3.21 | $2.00 |
+| Class 4 Micro SDHC card | $3.21 | $4.00 |
+| 70x90mm perfboard | $3.21 | $1.00 |
+| 470uF electrolytic capacitor | $0.26 | $0.10 |
+| 150nF polyester capacitor | $1.28 | $0.15 |
+| 10k ohm 1/4W resistor | $0.19 | $0.05 |
+| 18k ohm 1/4W resistor | $0.19 | $0.05 |
+| 12V female DC power jack | $0.51 | $0.25 |
+| 2.54mm jumper cap | $0.13 | $0.02 |
+| 2.54mm female pin header | $0.96 | $0.50 |
+| **Total Estimated Cost** | **$38.78** | **$27.12** |
 
 <table>
 	<tr>
@@ -23,13 +36,15 @@ The hardware uses an LM2596 DC-DC buck converter to regulate the input supply to
 	</tr>
 </table> 
 
+Notes:
+
+- Flow sensor pulse pin: GPIO13 (`FLOW_SENSOR_PIN`)
+- Storage: microSD card via `SD_MMC` in 1-bit mode
+- Frontend storage: `LittleFS` (`data/index.html`)
+
 ### Schematic
 
 <img src="doc/schematic.jpg" alt="Circuit schematic">
-
-Notes:
-
-The YF-S401 output signal is fed through a voltage divider built with 10 kΩ and 18 kΩ resistors to reduce the sensor signal to a level much closer to the 3.3 V logic range required by the ESP32-CAM input. The board also includes a small supply stabilization network on the main VCC rail: a 470 µF electrolytic capacitor and a 150 nF ceramic capacitor placed near the board input to absorb current spikes caused by the Wi-Fi radio and keep the voltage stable during transmission bursts.
 
 ## Current firmware behavior
 
@@ -90,9 +105,7 @@ The dashboard served from LittleFS provides three primary cards:
 3. Total pulses since boot, rendered with SI suffixes such as `k`, `M`, and `B`.
 
 ### GUI screenshot
-<video controls autoplay loop muted playsinline>
-  <source src="doc/gui_screenshot.mp4" type="video/mp4">
-</video>
+![GUI screenshot](/doc/gui_screenshot.gif)
 
 Historical chart:
 
@@ -206,6 +219,12 @@ pio run --target uploadfs --upload-port /dev/ttyUSB0
 
 ```bash
 pio device monitor --port /dev/ttyUSB0 --baud 115200
+```
+
+5. If it is required to save output to a file use:
+
+```bash
+pio device monitor --port /dev/ttyUSB0 --baud 115200 --rts 0 --dtr 0 --filter esp32_exception_decoder --filter time --filter log2file
 ```
 
 If upload fails, set the ESP32-CAM into flashing mode (IO0 to GND or hold the IO0 button as required by your adapter) and retry.
